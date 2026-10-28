@@ -2,8 +2,10 @@
 RFID Queue Server  (FastAPI + uvicorn + MongoDB)
 
 Flow:
-  RFID hardware -> POST /api/scan {"rollNo": "..."} or {"uid": "..."}
-  -> look up student in MongoDB -> add name to queue
+  Direct hardware route: RFID hardware -> /api/scan -> MongoDB lookup -> queue.
+  RC integration: RFID hardware -> RC API resolves UID to roll number ->
+                  RC server POSTs the resolved roll number to
+                  /api/integrations/rc/rfid-scan -> MongoDB lookup -> queue.
   Website also supports manual roll-no search + add.
   Queue updates are pushed live to every open browser (Server-Sent Events).
 
@@ -14,6 +16,7 @@ Run:
 import asyncio
 import json
 import os
+import hmac
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -36,6 +39,9 @@ ROLL_FIELD = os.getenv("ROLL_FIELD", "rollNo")
 NAME_FIELD = os.getenv("NAME_FIELD", "name")
 RFID_FIELD = os.getenv("RFID_FIELD", "rfid")  # only used if hardware sends card UID
 DEVICE_API_KEY = os.getenv("DEVICE_API_KEY", "")
+# Separate secret used only by the RC server when it calls this backend.
+# Configure the same strong random value in both deployments.
+RC_INTEGRATION_API_KEY = os.getenv("RC_INTEGRATION_API_KEY", "")
 
 BASE_DIR = Path(__file__).parent
 db = {}  # filled at startup: db["students"], db["queue"]
@@ -252,7 +258,9 @@ async def register_student_rfid(roll_input: str, uid_input: str):
 @app.post("/api/arcade/scan")
 async def scan(request: Request):
     global pending_registration
-    if DEVICE_API_KEY and request.headers.get("x-api-key") != DEVICE_API_KEY:
+
+    # Legacy hardware routes retain their existing optional device-key behavior.
+    if DEVICE_API_KEY and request.headers.get("x-api-key", "") != DEVICE_API_KEY:
         return JSONResponse({"ok": False, "error": "Invalid device key"}, status_code=401)
 
     body = await read_body(request)
@@ -299,6 +307,68 @@ async def scan(request: Request):
         roll = doc.get(ROLL_FIELD)
 
     status, data = await add_to_queue(roll, "rfid")
+    return JSONResponse(data, status_code=status)
+
+
+@app.post("/api/integrations/rc/rfid-scan")
+async def receive_rc_scan(request: Request):
+    """Receive the resolved participant from the RC server.
+
+    Intended flow:
+      RFID reader -> RC API resolves UID -> RC server POSTs resolved roll number here.
+
+    Expected request JSON: {"rollNumber": "23CEB0B10"}
+    Also accepts rollNo/roll_no/roll, or those fields nested under student/data.
+    The UID itself is not used for lookup here because RC is responsible for
+    resolving the UID to the student's roll number.
+    """
+    if not RC_INTEGRATION_API_KEY:
+        return JSONResponse(
+            {"ok": False, "error": "RC integration is not configured on this server"},
+            status_code=503,
+        )
+
+    supplied_key = request.headers.get("x-api-key", "")
+    if not hmac.compare_digest(supplied_key, RC_INTEGRATION_API_KEY):
+        return JSONResponse({"ok": False, "error": "Invalid RC integration key"}, status_code=401)
+
+    body = await read_body(request)
+    if not isinstance(body, dict):
+        return JSONResponse({"ok": False, "error": "Expected a JSON object"}, status_code=400)
+
+    # Accommodate common RC response/request shapes without assuming a single wrapper.
+    candidates = [body]
+    for wrapper in ("student", "participant", "data", "result"):
+        nested = body.get(wrapper)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+
+    roll = None
+    for candidate in candidates:
+        roll = (candidate.get("rollNumber") or candidate.get("rollNo")
+                or candidate.get("roll_no") or candidate.get("roll"))
+        if roll:
+            break
+
+    if not roll:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "RC response must include a resolved roll number",
+                "acceptedFields": ["rollNumber", "rollNo", "roll_no", "roll"],
+            },
+            status_code=400,
+        )
+
+    # Queue logic and duplicate handling remain centralized in add_to_queue().
+    status, data = await add_to_queue(roll, "rfid")
+    if status in (201, 409) and isinstance(data.get("entry"), dict):
+        entry = data["entry"]
+        data["participant"] = {
+            "rollNumber": entry.get("rollNo"),
+            "name": entry.get("name"),
+            "personType": entry.get("personType", "student"),
+        }
     return JSONResponse(data, status_code=status)
 
 
