@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RFID Queue Control</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #04070c;
+    --panel: rgba(7, 15, 24, 0.82);
+    --line: rgba(0, 229, 255, 0.16);
+    --line-strong: rgba(0, 229, 255, 0.45);
+    --cyan: #00e5ff;
+    --cyan-dim: rgba(0, 229, 255, 0.12);
+    --text: #d8f6ff;
+    --muted: #5f8796;
+    --ok: #39ff88;
+    --warn: #ffb020;
+    --err: #ff3b5c;
+    --head: "Orbitron", sans-serif;
+    --body: "Rajdhani", sans-serif;
+    --mono: "Share Tech Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+    background:
+      radial-gradient(ellipse at 20% 0%, rgba(0, 229, 255, 0.10), transparent 55%),
+      radial-gradient(ellipse at 100% 100%, rgba(57, 255, 136, 0.06), transparent 50%),
+      linear-gradient(rgba(0, 229, 255, 0.045) 1px, transparent 1px) 0 0 / 40px 40px,
+      linear-gradient(90deg, rgba(0, 229, 255, 0.045) 1px, transparent 1px) 0 0 / 40px 40px,
+      var(--bg);
+    background-attachment: fixed;
+    color: var(--text);
+    font-family: var(--body);
+    font-size: 16px;
+    overflow-x: hidden;
+  }
+  /* moving scan line across the whole screen */
+  body::after {
+    content: ""; position: fixed; left: 0; right: 0; top: -120px; height: 120px; pointer-events: none; z-index: 50;
+    background: linear-gradient(to bottom, transparent, rgba(0, 229, 255, 0.05), transparent);
+    animation: sweep 7s linear infinite;
+  }
+  @keyframes sweep { to { top: 100%; } }
+
+  /* ---------- header ---------- */
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+    padding: 16px 28px; border-bottom: 1px solid var(--line);
+    background: linear-gradient(to bottom, rgba(0, 229, 255, 0.06), transparent);
+  }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .brand svg { width: 42px; height: 42px; filter: drop-shadow(0 0 8px var(--cyan)); }
+  .brand h1 { font-family: var(--head); font-size: 20px; letter-spacing: .18em; margin: 0; font-weight: 900; }
+  .brand h1 span { color: var(--cyan); }
+  .brand small { display: block; font-family: var(--mono); color: var(--muted); font-size: 12px; letter-spacing: .2em; margin-top: 2px; }
+  .sys { display: flex; align-items: center; gap: 22px; font-family: var(--mono); font-size: 13px; color: var(--muted); }
+  .sys b { color: var(--text); font-weight: normal; }
+  .link { display: flex; align-items: center; gap: 8px; }
+  .led { width: 9px; height: 9px; border-radius: 50%; background: var(--err); box-shadow: 0 0 10px var(--err); }
+  .led.on { background: var(--ok); box-shadow: 0 0 12px var(--ok); animation: blink 1.6s ease-in-out infinite; }
+  @keyframes blink { 50% { opacity: .35; } }
+  #clock { font-size: 18px; color: var(--cyan); letter-spacing: .08em; }
+
+  /* ---------- layout ---------- */
+  .wrap { max-width: 1360px; margin: 0 auto; padding: 22px 28px 40px; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 22px; }
+  main { display: grid; grid-template-columns: 400px minmax(0, 1fr); gap: 22px; align-items: start; }
+  .col { display: flex; flex-direction: column; gap: 22px; min-width: 0; }
+  .tablewrap { overflow-x: auto; }
+  @media (max-width: 1000px) { main { grid-template-columns: minmax(0, 1fr); } .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 560px) { .wrap { padding: 16px; } header { padding: 14px 16px; } .sys { gap: 14px; } }
+
+  /* ---------- panels with corner brackets ---------- */
+  .panel {
+    position: relative; background: var(--panel); border: 1px solid var(--line);
+    padding: 20px; backdrop-filter: blur(6px);
+  }
+  .panel::before, .panel::after {
+    content: ""; position: absolute; width: 16px; height: 16px; border: 2px solid var(--cyan); pointer-events: none;
+  }
+  .panel::before { top: -1px; left: -1px; border-right: none; border-bottom: none; }
+  .panel::after { bottom: -1px; right: -1px; border-left: none; border-top: none; }
+  .ptitle {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    font-family: var(--head); font-size: 12px; letter-spacing: .22em; color: var(--cyan); margin: 0 0 16px;
+  }
+  .ptitle .tag { font-family: var(--mono); font-size: 11px; color: var(--muted); letter-spacing: .1em; }
+
+  /* ---------- stat tiles ---------- */
+  .stat { padding: 14px 18px; }
+  .stat .k { font-family: var(--mono); font-size: 12px; letter-spacing: .18em; color: var(--muted); }
+  .stat .v { font-family: var(--head); font-size: 32px; font-weight: 700; margin-top: 4px; color: var(--text); text-shadow: 0 0 14px rgba(0, 229, 255, .35); }
+  .stat .v.c { color: var(--cyan); }
+  .stat .v.g { color: var(--ok); text-shadow: 0 0 14px rgba(57, 255, 136, .35); }
+  .stat .v.small { font-size: 20px; padding-top: 8px; }
+
+  /* ---------- scanner ---------- */
+  .scanner { --c: var(--cyan); text-align: center; }
+  .radar {
+    position: relative; width: 190px; height: 190px; margin: 6px auto 18px; border-radius: 50%;
+    border: 1px solid var(--line-strong);
+    background:
+      radial-gradient(circle, transparent 30%, var(--cyan-dim) 31%, transparent 32%, transparent 60%, var(--cyan-dim) 61%, transparent 62%),
+      radial-gradient(circle, rgba(0, 229, 255, .08), transparent 70%);
+  }
+  .radar::before {
+    content: ""; position: absolute; inset: 0; border-radius: 50%;
+    background: conic-gradient(from 0deg, transparent 0deg, transparent 280deg, color-mix(in srgb, var(--c) 55%, transparent) 360deg);
+    animation: spin 2.4s linear infinite;
+  }
+  .radar::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--line); }
+  .radar .core {
+    position: absolute; inset: 58px; border-radius: 50%; display: grid; place-items: center;
+    background: var(--bg); border: 2px solid var(--c); box-shadow: 0 0 22px color-mix(in srgb, var(--c) 60%, transparent), inset 0 0 18px color-mix(in srgb, var(--c) 30%, transparent);
+    transition: border-color .3s, box-shadow .3s; z-index: 1;
+  }
+  .radar .core svg { width: 34px; height: 34px; color: var(--c); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .scanner .state { font-family: var(--head); font-size: 15px; letter-spacing: .25em; color: var(--c); font-weight: 700; }
+  .scanner .who { font-family: var(--head); font-size: 24px; font-weight: 700; margin-top: 10px; min-height: 30px; word-break: break-word; }
+  .scanner .roll { font-family: var(--mono); color: var(--muted); margin-top: 4px; letter-spacing: .12em; min-height: 20px; }
+  .scanner.ok { --c: var(--ok); } .scanner.warn { --c: var(--warn); } .scanner.err { --c: var(--err); }
+  .scanner.hit { animation: hit .5s ease; }
+  @keyframes hit { 0% { transform: scale(.98); filter: brightness(1.8); } 100% { transform: scale(1); filter: none; } }
+
+  /* ---------- manual entry ---------- */
+  .cmd { display: flex; align-items: stretch; border: 1px solid var(--line-strong); background: rgba(0, 0, 0, .35); }
+  .cmd span { display: grid; place-items: center; padding: 0 12px; font-family: var(--mono); color: var(--cyan); font-size: 18px; }
+  .cmd input {
+    flex: 1; min-width: 0; background: transparent; border: 0; color: var(--text); padding: 13px 4px;
+    font: 18px var(--mono); letter-spacing: .12em; text-transform: uppercase; caret-color: var(--cyan);
+  }
+  .cmd input::placeholder { color: var(--muted); letter-spacing: .08em; }
+  .cmd input:focus { outline: none; }
+  .cmd:focus-within { border-color: var(--cyan); box-shadow: 0 0 16px rgba(0, 229, 255, .25); }
+  .hint { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .result { margin-top: 14px; }
+  .result .found { border: 1px solid var(--line); border-left: 3px solid var(--cyan); padding: 14px; background: var(--cyan-dim); }
+  .result .found .n { font-family: var(--head); font-size: 18px; font-weight: 700; }
+  .result .found .r { font-family: var(--mono); color: var(--muted); letter-spacing: .12em; margin: 2px 0 12px; }
+  .result .found .btn { width: 100%; }
+  .result .msg { font-family: var(--mono); color: var(--err); border-left: 3px solid var(--err); padding: 10px 12px; background: rgba(255, 59, 92, .08); }
+
+  /* ---------- buttons ---------- */
+  .btn {
+    --b: var(--cyan);
+    font: 700 13px var(--head); letter-spacing: .16em; text-transform: uppercase; cursor: pointer;
+    color: var(--b); background: color-mix(in srgb, var(--b) 10%, transparent); border: 1px solid var(--b);
+    padding: 11px 18px; clip-path: polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
+    transition: background .15s, color .15s, box-shadow .15s;
+  }
+  .btn:hover:not(:disabled) { background: var(--b); color: var(--bg); box-shadow: 0 0 18px var(--b); }
+  .btn:disabled { opacity: .35; cursor: not-allowed; }
+  .btn.solid { background: var(--b); color: var(--bg); }
+  .btn.red { --b: var(--err); }
+  .btn.green { --b: var(--ok); }
+  .btn.sm { padding: 7px 12px; font-size: 11px; clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px); }
+
+  /* ---------- queue ---------- */
+  .qactions { display: flex; gap: 10px; }
+  .serving {
+    display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 20px;
+    border: 1px solid var(--ok); background: linear-gradient(90deg, rgba(57, 255, 136, .14), rgba(57, 255, 136, .02));
+    padding: 18px 20px; margin-bottom: 18px; box-shadow: inset 0 0 30px rgba(57, 255, 136, .08);
+  }
+  .serving .lbl { font-family: var(--head); font-size: 11px; letter-spacing: .22em; color: var(--ok); writing-mode: vertical-rl; transform: rotate(180deg); }
+  .serving .n { font-family: var(--head); font-size: 28px; font-weight: 900; color: #fff; text-shadow: 0 0 16px rgba(57, 255, 136, .5); word-break: break-word; }
+  .serving .r { font-family: var(--mono); color: var(--ok); letter-spacing: .16em; margin-top: 4px; }
+  .serving.idle { border-color: var(--line); background: transparent; box-shadow: none; }
+  .serving.idle .lbl, .serving.idle .r { color: var(--muted); }
+  .serving.idle .n { color: var(--muted); text-shadow: none; font-size: 20px; }
+  .serving .acts { display: flex; gap: 8px; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font: 12px var(--mono); letter-spacing: .16em; color: var(--muted); font-weight: normal; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  td { padding: 12px 10px; border-bottom: 1px dashed rgba(0, 229, 255, .1); font-size: 17px; font-weight: 600; }
+  tbody tr { animation: rowIn .35s ease; }
+  tbody tr:hover td { background: var(--cyan-dim); }
+  @keyframes rowIn { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: none; } }
+  td.pos { font: 16px var(--mono); color: var(--cyan); width: 56px; }
+  td.mono { font: 15px var(--mono); letter-spacing: .1em; color: #9fdcec; }
+  td.src span { font: 11px var(--mono); letter-spacing: .12em; padding: 3px 8px; border: 1px solid var(--line-strong); color: var(--cyan); text-transform: uppercase; }
+  td.src span.manual { border-color: rgba(255, 176, 32, .5); color: var(--warn); }
+  td.time { font: 14px var(--mono); color: var(--muted); }
+  td.btns { text-align: right; white-space: nowrap; }
+  td.btns .btn { margin-left: 6px; }
+  .empty { text-align: center; font-family: var(--mono); color: var(--muted); letter-spacing: .14em; padding: 34px 0 20px; }
+  @media (max-width: 640px) { th.src, td.src, th.time, td.time { display: none; } td, th { padding-left: 6px; padding-right: 6px; } td { font-size: 15px; } td.btns .btn { margin-left: 3px; } .serving { grid-template-columns: 1fr; } .serving .lbl { writing-mode: horizontal-tb; transform: none; } }
+
+  /* ---------- log ---------- */
+  .log { font: 13px var(--mono); max-height: 210px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .log div { color: var(--muted); }
+  .log div b { font-weight: normal; }
+  .log .ok b { color: var(--ok); } .log .warn b { color: var(--warn); } .log .err b { color: var(--err); } .log .info b { color: var(--cyan); }
+  .log::-webkit-scrollbar { width: 6px; } .log::-webkit-scrollbar-thumb { background: var(--line-strong); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg viewBox="0 0 48 48" fill="none" stroke="#00e5ff" stroke-width="2">
+      <path d="M24 3 42 13.5v21L24 45 6 34.5v-21Z" />
+      <rect x="15" y="17" width="18" height="14" rx="2" />
+      <circle cx="20.5" cy="23.5" r="2" fill="#00e5ff" />
+      <circle cx="27.5" cy="23.5" r="2" fill="#00e5ff" />
+      <path d="M24 17v-5M24 12h0" stroke-linecap="round" />
+      <circle cx="24" cy="10.5" r="1.6" fill="#00e5ff" />
+      <path d="M19 31v4M29 31v4" />
+    </svg>
+    <div>
+      <h1>RFID <span>QUEUE</span></h1>
+      <small>STUDENT ACCESS CONTROL SYSTEM</small>
+    </div>
+  </div>
+  <div class="sys">
+    <div class="link"><span class="led" id="led"></span><span>LINK: <b id="linkText">CONNECTING</b></span></div>
+    <div id="clock">--:--:--</div>
+  </div>
+</header>
+
+<div class="wrap">
+  <section class="stats">
+    <div class="panel stat"><div class="k">IN QUEUE</div><div class="v c" id="sQueue">0</div></div>
+    <div class="panel stat"><div class="k">SERVED TODAY</div><div class="v g" id="sServed">0</div></div>
+    <div class="panel stat"><div class="k">SCANS TODAY</div><div class="v" id="sScans">0</div></div>
+    <div class="panel stat"><div class="k">SCANNER NODE</div><div class="v small c" id="sNode">STANDBY</div></div>
+  </section>
+
+  <main>
+    <div class="col">
+      <div class="panel scanner" id="scanner">
+        <div class="ptitle"><span>// RFID SCANNER</span><span class="tag">NODE-01</span></div>
+        <div class="radar">
+          <div class="core">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <rect x="4" y="6" width="16" height="12" rx="2" />
+              <path d="M8 10h3M8 14h6" />
+              <path d="M17 9.5a3 3 0 0 1 0 5" />
+            </svg>
+          </div>
+        </div>
+        <div class="state" id="scanState">AWAITING SCAN</div>
+        <div class="who" id="scanName">Tap RFID card</div>
+        <div class="roll" id="scanRoll"></div>
+      </div>
+
+      <div class="panel">
+        <div class="ptitle"><span>// MANUAL OVERRIDE</span><span class="tag">ROLL NO. LOOKUP</span></div>
+        <form id="searchForm" autocomplete="off">
+          <div class="cmd">
+            <span>&gt;</span>
+            <input id="rollInput" placeholder="ENTER ROLL NO" autofocus />
+            <button class="btn solid" type="submit">Search</button>
+          </div>
+        </form>
+        <div class="hint">ENTER = search · SHIFT+ENTER = search &amp; add</div>
+        <div class="result" id="result"></div>
+      </div>
+
+      <div class="panel">
+        <div class="ptitle"><span>// SYSTEM LOG</span><span class="tag">LIVE</span></div>
+        <div class="log" id="log"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="ptitle">
+        <span>// QUEUE</span>
+        <div class="qactions">
+          <button class="btn green sm" id="nextBtn">Serve next</button>
+          <button class="btn red sm" id="clearBtn">Clear</button>
+        </div>
+      </div>
+
+      <div class="serving idle" id="serving">
+        <div class="lbl">NOW SERVING</div>
+        <div><div class="n">No students in queue</div><div class="r">—</div></div>
+        <div class="acts"></div>
+      </div>
+
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>POS</th><th>NAME</th><th>ROLL NO.</th><th class="src">VIA</th><th class="time">TIME</th><th></th></tr></thead>
+          <tbody id="qbody"></tbody>
+        </table>
+      </div>
+      <div class="empty" id="empty">[ NO ONE ELSE WAITING ]</div>
+    </div>
+  </main>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const hhmm = (d) => new Date(d).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+const hhmmss = (d = new Date()) => d.toLocaleTimeString([], { hour12: false });
+
+async function api(url, opts = {}) {
+  const res = await fetch(url, { headers: { "Content-Type": "application/json" }, ...opts });
+  return { status: res.status, data: await res.json().catch(() => ({})) };
+}
+
+// ---------- clock ----------
+setInterval(() => ($("clock").textContent = hhmmss()), 1000);
+$("clock").textContent = hhmmss();
+
+// ---------- system log ----------
+function log(type, text) {
+  const el = document.createElement("div");
+  el.className = type;
+  el.innerHTML = `[${hhmmss()}] <b>${esc(text)}</b>`;
+  $("log").prepend(el);
+  while ($("log").children.length > 40) $("log").lastChild.remove();
+}
+log("info", "SYSTEM BOOT · INTERFACE READY");
+
+// ---------- queue rendering ----------
+function renderQueue(items) {
+  $("sQueue").textContent = items.length;
+  $("nextBtn").disabled = !items.length;
+  $("clearBtn").disabled = !items.length;
+
+  const first = items[0];
+  const box = $("serving");
+  if (first) {
+    box.className = "serving";
+    box.innerHTML = `
+      <div class="lbl">NOW SERVING</div>
+      <div><div class="n">${esc(first.name)}</div><div class="r">${esc(first.rollNo)} · ${esc(first.source).toUpperCase()} · ${hhmm(first.addedAt)}</div></div>
+      <div class="acts">
+        <button class="btn green sm" data-id="${first._id}" data-act="served">Done</button>
+        <button class="btn red sm" data-id="${first._id}" data-act="removed">✕</button>
+      </div>`;
+  } else {
+    box.className = "serving idle";
+    box.innerHTML = `<div class="lbl">NOW SERVING</div><div><div class="n">No students in queue</div><div class="r">—</div></div><div class="acts"></div>`;
+  }
+
+  const rest = items.slice(1);
+  $("empty").style.display = rest.length ? "none" : "block";
+  $("qbody").innerHTML = rest.map((q, i) => `
+    <tr>
+      <td class="pos">#${String(i + 2).padStart(2, "0")}</td>
+      <td>${esc(q.name)}</td>
+      <td class="mono">${esc(q.rollNo)}</td>
+      <td class="src"><span class="${q.source === "manual" ? "manual" : ""}">${esc(q.source)}</span></td>
+      <td class="time">${hhmm(q.addedAt)}</td>
+      <td class="btns">
+        <button class="btn green sm" data-id="${q._id}" data-act="served">Done</button>
+        <button class="btn red sm" data-id="${q._id}" data-act="removed">✕</button>
+      </td>
+    </tr>`).join("");
+}
+
+// Done / remove buttons (event delegation)
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-act]");
+  if (!b) return;
+  api(`/api/queue/${b.dataset.id}`, { method: "PATCH", body: JSON.stringify({ status: b.dataset.act }) });
+});
+
+// ---------- scanner panel ----------
+let resetTimer;
+function showScan({ ok, name, rollNo, message, source }) {
+  const s = $("scanner");
+  const kind = ok ? "ok" : name ? "warn" : "err";
+  s.className = `panel scanner ${kind}`;
+  void s.offsetWidth;
+  s.classList.add("hit");
+  $("scanState").textContent = ok ? "ACCESS GRANTED" : name ? "DUPLICATE ENTRY" : "UNKNOWN ID";
+  $("scanName").textContent = ok || name ? name : message;
+  $("scanRoll").textContent = rollNo ? `ID: ${rollNo}` : "";
+  $("sNode").textContent = source === "manual" ? "MANUAL" : "ACTIVE";
+  log(kind, `${source === "manual" ? "MANUAL" : "RFID"} › ${message}`);
+
+  clearTimeout(resetTimer);
+  resetTimer = setTimeout(() => {
+    s.className = "panel scanner";
+    $("scanState").textContent = "AWAITING SCAN";
+    $("scanName").textContent = "Tap RFID card";
+    $("scanRoll").textContent = "";
+    $("sNode").textContent = "STANDBY";
+  }, 6000);
+}
+
+// ---------- live link to server ----------
+function connect() {
+  const es = new EventSource("/api/events");
+  es.onopen = () => {
+    $("led").classList.add("on");
+    $("linkText").textContent = "ONLINE";
+    log("info", "LINK ESTABLISHED");
+  };
+  es.onerror = () => {
+    $("led").classList.remove("on");
+    $("linkText").textContent = "OFFLINE";
+  };
+  es.addEventListener("queue", (e) => renderQueue(JSON.parse(e.data)));
+  es.addEventListener("stats", (e) => {
+    const s = JSON.parse(e.data);
+    $("sServed").textContent = s.servedToday;
+    $("sScans").textContent = s.scansToday;
+  });
+  es.addEventListener("scan", (e) => showScan(JSON.parse(e.data)));
+}
+connect();
+
+// ---------- manual search ----------
+let addDirectly = false;
+$("rollInput").addEventListener("keydown", (e) => { addDirectly = e.key === "Enter" && e.shiftKey; });
+
+$("searchForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const roll = $("rollInput").value.trim();
+  if (!roll) return;
+  if (addDirectly) { addDirectly = false; return add(roll); }
+
+  $("result").innerHTML = `<div class="hint">QUERYING DATABASE…</div>`;
+  const { status, data } = await api(`/api/students/${encodeURIComponent(roll)}`);
+  if (status !== 200) {
+    $("result").innerHTML = `<div class="msg">NO RECORD FOUND · ${esc(roll.toUpperCase())}</div>`;
+    log("err", `LOOKUP › ${roll.toUpperCase()} not found`);
+    return;
+  }
+  const s = data.student;
+  $("result").innerHTML = `
+    <div class="found">
+      <div class="n">${esc(s.name)}</div>
+      <div class="r">ID: ${esc(s.rollNo)}</div>
+      <button class="btn solid" id="addBtn" ${data.inQueue ? "disabled" : ""}>
+        ${data.inQueue ? "Already in queue" : "Add to queue"}
+      </button>
+    </div>`;
+  if (!data.inQueue) $("addBtn").onclick = () => add(s.rollNo);
+});
+
+async function add(roll) {
+  const { status, data } = await api("/api/queue", { method: "POST", body: JSON.stringify({ rollNo: roll }) });
+  if (status === 201) {
+    $("result").innerHTML = "";
+    $("rollInput").value = "";
+  } else {
+    $("result").innerHTML = `<div class="msg">${esc((data.error || "Could not add").toUpperCase())}</div>`;
+  }
+  $("rollInput").focus();
+}
+
+// ---------- queue actions ----------
+$("nextBtn").onclick = () => api("/api/queue/next", { method: "POST" });
+$("clearBtn").onclick = () => { if (confirm("Clear the whole queue?")) api("/api/queue", { method: "DELETE" }); };
+</script>
+</body>
+</html>
