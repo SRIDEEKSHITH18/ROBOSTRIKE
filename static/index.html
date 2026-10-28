@@ -140,6 +140,12 @@
   .cmd:focus-within { border-color: var(--cyan); box-shadow: 0 0 16px rgba(0, 229, 255, .25); }
   .hint { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 10px; }
   .result { margin-top: 14px; }
+  .outsider-form { display: grid; gap: 10px; margin-top: 8px; }
+  .outsider-form label { display: grid; gap: 6px; color: var(--muted); font: 12px var(--mono); letter-spacing: .1em; }
+  .outsider-form input { width: 100%; min-width: 0; box-sizing: border-box; padding: 12px; background: rgba(0,0,0,.35); border: 1px solid var(--line-strong); color: var(--text); font: 15px var(--mono); }
+  .outsider-form input:focus { outline: 1px solid var(--cyan); border-color: var(--cyan); }
+  .outsider-form .btn { width: 100%; }
+
   .result .found { border: 1px solid var(--line); border-left: 3px solid var(--cyan); padding: 14px; background: var(--cyan-dim); }
   .result .found .n { font-family: var(--head); font-size: 18px; font-weight: 700; }
   .result .found .r { font-family: var(--mono); color: var(--muted); letter-spacing: .12em; margin: 2px 0 12px; }
@@ -263,6 +269,21 @@
       </div>
 
       <div class="panel">
+        <div class="ptitle"><span>// OUTSIDER OVERRIDE</span><span class="tag">VISITOR ENTRY</span></div>
+        <form id="outsiderForm" class="outsider-form" autocomplete="off">
+          <label>OUTSIDER NAME
+            <input id="outsiderName" name="name" maxlength="120" placeholder="ENTER FULL NAME" required />
+          </label>
+          <label>ROLE / AFFILIATION
+            <input id="outsiderRole" name="role" maxlength="80" placeholder="E.G. VISITOR, GUEST, STAFF" required />
+          </label>
+          <button class="btn solid" type="submit">Add outsider to queue</button>
+        </form>
+        <div class="result" id="outsiderResult" aria-live="polite"></div>
+        <div class="hint">Outsiders do not need a student roll number or an RFID registration.</div>
+      </div>
+
+      <div class="panel">
         <div class="ptitle"><span>// SYSTEM LOG</span><span class="tag">LIVE</span></div>
         <div class="log" id="log"></div>
       </div>
@@ -331,7 +352,7 @@ function renderQueue(items) {
     box.className = "serving";
     box.innerHTML = `
       <div class="lbl">NOW SERVING</div>
-      <div><div class="n">${esc(first.name)}</div><div class="r">${esc(first.rollNo)} · ${esc(first.source).toUpperCase()} · ${hhmm(first.addedAt)}</div></div>
+      <div><div class="n">${esc(first.name)}</div><div class="r">${esc(first.personType === "outsider" ? `OUTSIDER · ${first.role}` : first.rollNo)} · ${esc(first.source).toUpperCase()} · ${hhmm(first.addedAt)}</div></div>
       <div class="acts">
         <button class="btn green sm" data-id="${first._id}" data-act="served">Done</button>
         <button class="btn red sm" data-id="${first._id}" data-act="removed">✕</button>
@@ -347,7 +368,7 @@ function renderQueue(items) {
     <tr>
       <td class="pos">#${String(i + 2).padStart(2, "0")}</td>
       <td>${esc(q.name)}</td>
-      <td class="mono">${esc(q.rollNo)}</td>
+      <td class="mono">${esc(q.personType === "outsider" ? `OUTSIDER · ${q.role}` : q.rollNo)}</td>
       <td class="src"><span class="${q.source === "manual" ? "manual" : ""}">${esc(q.source)}</span></td>
       <td class="time">${hhmm(q.addedAt)}</td>
       <td class="btns">
@@ -433,10 +454,34 @@ $("searchForm").addEventListener("submit", async (e) => {
       <div class="n">${esc(s.name)}</div>
       <div class="r">ID: ${esc(s.rollNo)}</div>
       <button class="btn solid" id="addBtn" ${data.inQueue ? "disabled" : ""}>
-        ${data.inQueue ? "Already in queue" : "Add to queue"}
+        ${data.inQueue ? "Already in queue" : "Add to queue manually"}
       </button>
+      <button class="btn" id="registerCardBtn" style="margin-top:8px;width:100%">
+        Register / update RFID card &amp; add to queue
+      </button>
+      <div class="hint" style="margin-top:8px">Select this student, then ask them to tap their card at the scanner. The next UID-only scan will be linked to this roll number.</div>
     </div>`;
   if (!data.inQueue) $("addBtn").onclick = () => add(s.rollNo);
+  $("registerCardBtn").onclick = async () => {
+    const button = $("registerCardBtn");
+    button.disabled = true;
+    button.textContent = "WAITING FOR CARD TAP…";
+    const { status: armStatus, data: armData } = await api("/api/rfid/registration/arm", {
+      method: "POST", body: JSON.stringify({ rollNo: s.rollNo })
+    });
+    if (armStatus === 200 && armData.ok) {
+      $("result").innerHTML = `<div class="found"><div class="n">${esc(s.name)}</div><div class="r">${esc(s.rollNo)}</div><div class="hint">READY — TAP THIS STUDENT'S CARD NOW. The scanned UID will be saved in MongoDB and the student added to the queue.</div><button class="btn" id="cancelRegistrationBtn" style="margin-top:8px;width:100%">Cancel card registration</button></div>`;
+      $("cancelRegistrationBtn").onclick = async () => {
+        await api("/api/rfid/registration/arm", { method: "DELETE" });
+        $("result").innerHTML = `<div class="hint">Card registration cancelled.</div>`;
+      };
+      log("ok", `RFID REGISTRATION ARMED › ${s.rollNo} · waiting for card tap`);
+    } else {
+      button.disabled = false;
+      button.textContent = "Register / update RFID card & add to queue";
+      $("result").insertAdjacentHTML("beforeend", `<div class="msg">${esc(armData.error || "Could not arm RFID registration")}</div>`);
+    }
+  };
 });
 
 async function add(roll) {
@@ -449,6 +494,36 @@ async function add(roll) {
   }
   $("rollInput").focus();
 }
+
+// ---------- outsider / visitor manual override ----------
+$("outsiderForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const name = $("outsiderName").value.trim();
+  const role = $("outsiderRole").value.trim();
+  if (!name || !role) return;
+
+  const button = e.currentTarget.querySelector('button[type="submit"]');
+  button.disabled = true;
+  $("outsiderResult").innerHTML = `<div class="hint">ADDING OUTSIDER…</div>`;
+  try {
+    const { status, data } = await api("/api/queue/outsider", {
+      method: "POST",
+      body: JSON.stringify({ name, role })
+    });
+    if (status === 201) {
+      $("outsiderResult").innerHTML = `<div class="found"><div class="n">${esc(name)}</div><div class="r">OUTSIDER · ${esc(role)}</div>Added to queue.</div>`;
+      $("outsiderName").value = "";
+      $("outsiderRole").value = "";
+      log("ok", `OUTSIDER › ${name} (${role}) added to queue`);
+    } else {
+      $("outsiderResult").innerHTML = `<div class="msg">${esc((data.error || "COULD NOT ADD OUTSIDER").toUpperCase())}</div>`;
+    }
+  } catch (err) {
+    $("outsiderResult").innerHTML = `<div class="msg">REQUEST FAILED · CHECK SERVER CONNECTION</div>`;
+  } finally {
+    button.disabled = false;
+  }
+});
 
 // ---------- queue actions ----------
 $("nextBtn").onclick = () => api("/api/queue/next", { method: "POST" });
