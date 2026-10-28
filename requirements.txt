@@ -1,5 +1,6 @@
+
 fastapi>=0.110
 uvicorn[standard]>=0.29
-pymongo>=4.10
+pymongo[srv]>=4.10
 python-dotenv>=1.0
 python-multipart>=0.0.9
