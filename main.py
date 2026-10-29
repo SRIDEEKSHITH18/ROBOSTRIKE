@@ -69,12 +69,14 @@ class RCScanRequest(BaseModel):
 
 class StartRoundRequest(BaseModel):
     rollNumber: str = Field(min_length=1, max_length=80)
-    roundType: RoundType
+    # Optional for compatibility; the backend chooses the next unfinished round.
+    roundType: RoundType | None = None
 
 
 class StartQueuedRoundRequest(BaseModel):
     queueEntryId: str = Field(min_length=1, max_length=80)
-    roundType: RoundType
+    # The backend enforces the participant's next round in sequence.
+    roundType: RoundType | None = None
 
 
 class DartEvent(BaseModel):
@@ -234,7 +236,10 @@ async def get_queue() -> list:
     items = [serialize(d) async for d in cursor]
     done = await completed_types_by_roll([i["rollNo"] for i in items if i.get("rollNo")])
     for item in items:
-        item["completedRoundTypes"] = done.get(item.get("rollNo"), [])
+        completed = done.get(item.get("rollNo"), [])
+        item["completedRoundTypes"] = completed
+        item["remainingRoundTypes"] = [t for t in ROUND_TYPES if t not in completed]
+        item["nextRoundType"] = next((t for t in ROUND_TYPES if t not in completed), None)
     return items
 
 
@@ -315,6 +320,7 @@ async def add_to_queue(roll_input, source: str):
         "personType": "student",
         "source": source,  # "rfid" or "manual"
         "status": "waiting",
+        "nextRoundType": "static",
         "addedAt": now(),
     }
     result = await db["queue"].insert_one(entry)
@@ -592,12 +598,25 @@ async def _start_round_for_player(roll_no: str, player_name: str, round_type: st
                         "playerName": active_round["playerName"],
                         "roundType": active_round.get("roundType"),
                         "dartsReceived": active_round.get("dartsReceived", 0),
+                        "queueEntryId": str(active_round.get("queueEntryId")) if active_round.get("queueEntryId") else None,
                     },
                 }, status_code=409)
             await db["active_rounds"].delete_one({"_id": "default"})
 
-        # A participant may complete each round type only once.
+        # Enforce the sequence Static -> Linear -> Revolving. Queue entries
+        # always use the next unfinished round, so the operator never reselects it.
         done_types = await completed_round_types(roll_no)
+        next_type = next((t for t in ROUND_TYPES if t not in done_types), None)
+        if queue_entry is not None:
+            round_type = next_type
+        elif round_type is None:
+            round_type = next_type
+        if round_type is None:
+            return JSONResponse({
+                "ok": False,
+                "error": f"{player_name} has already completed all three round types.",
+                "completedRoundTypes": done_types,
+            }, status_code=409)
         if round_type in done_types:
             if len(done_types) == len(ROUND_TYPES):
                 message = f"{player_name} has already completed all three round types."
@@ -645,7 +664,8 @@ async def _start_round_for_player(roll_no: str, player_name: str, round_type: st
         round_id = result.inserted_id
         await db["active_rounds"].replace_one(
             {"_id": "default"},
-            {"_id": "default", "roundId": round_id, "rollNo": roll_no, "roundType": round_type, "startedAt": now()},
+            {"_id": "default", "roundId": round_id, "rollNo": roll_no, "roundType": round_type,
+             "queueEntryId": queue_entry_id, "startedAt": now()},
             upsert=True,
         )
 
@@ -683,13 +703,14 @@ async def start_game_round(payload: StartRoundRequest):
         {"rollNo": student["rollNo"], "status": "waiting"},
         sort=[("addedAt", 1)],
     )
-    return await _start_round_for_player(student["rollNo"], student["name"], payload.roundType.value, queue_entry)
+    selected_type = payload.roundType.value if payload.roundType else None
+    return await _start_round_for_player(student["rollNo"], student["name"], selected_type, queue_entry)
 
 
 @app.post("/api/games/rounds/start-from-queue")
 async def start_game_round_from_queue(payload: StartQueuedRoundRequest):
     """Start the exact participant selected by the operator from the waiting queue."""
-    round_type = payload.roundType.value
+    round_type = payload.roundType.value if payload.roundType else None
     try:
         queue_entry_oid = ObjectId(payload.queueEntryId)
     except InvalidId:
@@ -842,14 +863,16 @@ async def _record_dart_for_active_round(dart_fields: dict, source: str):
                     # All of Static, Linear and Revolving are done.
                     await db["queue"].update_one(
                         {"_id": round_doc["queueEntryId"], "status": "playing"},
-                        {"$set": {"status": "served", "doneAt": now()}},
+                        {"$set": {"status": "served", "doneAt": now(), "nextRoundType": None}},
                     )
                     queue_status = "served"
                 else:
-                    # Round types remain: back to waiting so the operator can pick them again.
+                    # Keep the same queue entry and move it to its next round stage.
+                    next_type = next((t for t in ROUND_TYPES if t not in summary["completedRoundTypes"]), None)
                     await db["queue"].update_one(
                         {"_id": round_doc["queueEntryId"], "status": "playing"},
-                        {"$set": {"status": "waiting"}, "$unset": {"startedAt": ""}},
+                        {"$set": {"status": "waiting", "nextRoundType": next_type, "lastCompletedRoundType": round_type},
+                         "$unset": {"startedAt": ""}},
                     )
                     queue_status = "waiting"
 
@@ -1033,6 +1056,7 @@ async def add_outsider(request: Request):
         "personType": "outsider",
         "source": "manual",
         "status": "waiting",
+        "nextRoundType": "static",
         "addedAt": now(),
     }
     await db["queue"].insert_one(entry)
@@ -1070,15 +1094,40 @@ async def serve_next():
 # 7) Mark one entry served / removed
 @app.patch("/api/queue/{entry_id}")
 async def update_entry(entry_id: str, request: Request):
+    """Remove/serve a queue entry. Removing a participant also cancels their active round."""
     body = await read_body(request)
     status = "removed" if body.get("status") == "removed" else "served"
     try:
         oid = ObjectId(entry_id)
     except InvalidId:
         raise HTTPException(400, "Invalid id")
-    await db["queue"].update_one({"_id": oid}, {"$set": {"status": status, "doneAt": now()}})
+
+    entry = await db["queue"].find_one({"_id": oid})
+    if not entry:
+        raise HTTPException(404, "Queue entry not found")
+
+    if status == "removed":
+        async with game_state_lock:
+            active = await db["active_rounds"].find_one({"_id": "default"})
+            if active:
+                active_round = await db["game_rounds"].find_one(
+                    {"_id": active.get("roundId"), "status": "in_progress"}
+                )
+                if active_round and active_round.get("queueEntryId") == oid:
+                    await db["game_rounds"].update_one(
+                        {"_id": active_round["_id"], "status": "in_progress"},
+                        {"$set": {"status": "cancelled", "cancelledAt": now(), "cancelReason": "participant_removed"}},
+                    )
+                    await db["active_rounds"].delete_one(
+                        {"_id": "default", "roundId": active_round["_id"]}
+                    )
+
+    await db["queue"].update_one(
+        {"_id": oid},
+        {"$set": {"status": status, "doneAt": now(), "nextRoundType": None}},
+        )
     await broadcast_queue()
-    return {"ok": True}
+    return {"ok": True, "status": status}
 
 
 # 8) Clear the whole queue
