@@ -1,0 +1,136 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ROBOSTRIKE | RFID API Specifications</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 28px;
+      background: #080d17; color: #e8f2ff;
+      font: 15px/1.6 "Segoe UI", Arial, sans-serif;
+    }
+    main { max-width: 920px; margin: auto; }
+    h1 { font-size: clamp(23px, 4vw, 32px); }
+    h1 span, .accent { color: #56e5f3; }
+    .muted { color: #9aacc5; }
+    .card {
+      margin: 18px 0; padding: 20px;
+      background: #111b2b; border: 1px solid #26364c;
+      border-radius: 14px; overflow-wrap: anywhere;
+    }
+    code, pre, input, select {
+      font-family: Consolas, monospace;
+    }
+    code {
+      color: #7eeafa; background: #08111e;
+      padding: 4px 7px; border-radius: 5px;
+    }
+    pre {
+      padding: 15px; background: #080d17;
+      border: 1px solid #26364c; border-radius: 8px;
+      overflow-x: auto; color: #d9e9ff;
+    }
+    .line { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
+    .label { min-width: 130px; color: #9aacc5; }
+    input, select {
+      width: 100%; padding: 12px; border-radius: 8px;
+      border: 1px solid #354963; background: #080d17;
+      color: #e8f2ff;
+    }
+    button {
+      padding: 12px 18px; border: 0; border-radius: 8px;
+      background: #56e5f3; color: #06121b;
+      font-weight: 700; cursor: pointer;
+    }
+    #result { white-space: pre-wrap; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>⚙ EMBEDDED TEAM <span>RFID API SPECIFICATIONS</span></h1>
+  <p class="muted">Connection details for ESP32, Arduino, Raspberry Pi, or another RFID reader.</p>
+
+  <section class="card">
+    <strong class="accent">SERVER HOST / DEPLOYMENT DOMAIN</strong>
+    <p id="host"></p>
+    <p class="muted">Use this deployed HTTPS address for your hardware requests.</p>
+  </section>
+
+  <section class="card">
+    <h2>API configuration</h2>
+    <div class="line"><span class="label">HTTP method</span><strong>POST</strong></div>
+    <div class="line"><span class="label">Primary endpoint</span><code id="primary"></code></div>
+    <div class="line"><span class="label">Fallback endpoint</span><code id="fallback"></code></div>
+    <div class="line"><span class="label">Content-Type</span><code>application/json</code></div>
+    <div class="line"><span class="label">Header</span><code>x-api-key: YOUR_DEVICE_API_KEY</code></div>
+    <p class="muted">Use the API key supplied by the server administrator. This public page does not display the secret key.</p>
+    <h3>Example JSON payload</h3>
+    <pre>{
+  "rollNumber": "23CEB0B10"
+}</pre>
+    <p class="muted">Accepted payload fields depend on the server's RFID API implementation.</p>
+  </section>
+
+  <section class="card">
+    <h2>Test a scan</h2>
+    <form id="testForm">
+      <p>
+        <label for="field">Payload field</label>
+        <select id="field">
+          <option value="rollNumber">rollNumber</option>
+          <option value="rollNo">rollNo</option>
+          <option value="rfid">rfid (card UID)</option>
+        </select>
+      </p>
+      <p>
+        <label for="payload">Roll number or card UID</label>
+        <input id="payload" required placeholder="e.g. 23CEB0B10">
+      </p>
+      <p>
+        <label for="key">Device API key</label>
+        <input id="key" type="password" required autocomplete="off"
+               placeholder="Enter your device API key">
+      </p>
+      <button type="submit">Send test request</button>
+    </form>
+    <h3>Response</h3>
+    <pre id="result">Waiting for test…</pre>
+  </section>
+
+  <p class="muted">Keep API keys private. Use HTTPS and only test with authorized devices.</p>
+</main>
+<script>
+  const host = window.location.origin;
+  document.getElementById("host").textContent = host;
+  document.getElementById("primary").textContent = host + "/api/arcade/scan";
+  document.getElementById("fallback").textContent = host + "/api/rfid/scan";
+
+  document.getElementById("testForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const result = document.getElementById("result");
+    const field = document.getElementById("field").value;
+    const value = document.getElementById("payload").value.trim();
+    const key = document.getElementById("key").value;
+    result.textContent = "Sending request…";
+
+    try {
+      const response = await fetch(host + "/api/arcade/scan", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": key
+        },
+        body: JSON.stringify({ [field]: value })
+      });
+      const text = await response.text();
+      result.textContent = "HTTP " + response.status + "\n" + text;
+    } catch (error) {
+      result.textContent = "Request failed: " + error.message;
+    }
+  });
+</script>
+</body>
+</html>

@@ -125,6 +125,10 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Robostrike Queue and Leaderboard API", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
+@app.get("/endpoints", include_in_schema=False)
+async def endpoints_page():
+    return FileResponse(BASE_DIR / "static" / "endpoints.html")
+
 
 # ---------------- helpers ----------------
 def clean_roll(value) -> str:
