@@ -18,6 +18,7 @@ import hmac
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 
 from bson import ObjectId
@@ -27,6 +28,7 @@ from fastapi import FastAPI, HTTPException, Request, Header, Query
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pymongo import AsyncMongoClient, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -43,6 +45,9 @@ RC_QUEUE_API_KEY = os.getenv("RC_QUEUE_API_KEY", "")
 # Secret required by the OpenCV detection client when submitting darts (POST /api/games/darts).
 DARTS_API_KEY = os.getenv("DARTS_API_KEY", "")
 
+# Every participant plays each of these once (3 darts each).
+ROUND_TYPES = ("static", "linear", "revolving")
+
 BASE_DIR = Path(__file__).parent
 db = {}  # filled at startup: students, queue, game_rounds, active_rounds
 # Single-scanner station: an operator selects a student, then the next card tap
@@ -51,16 +56,25 @@ pending_registration = None
 pending_registration_lock = asyncio.Lock()
 game_state_lock = asyncio.Lock()  # one active dart round at a time
 
+
+class RoundType(str, Enum):
+    static = "static"
+    linear = "linear"
+    revolving = "revolving"
+
+
 class RCScanRequest(BaseModel):
     rollNumber: str
 
 
 class StartRoundRequest(BaseModel):
     rollNumber: str = Field(min_length=1, max_length=80)
+    roundType: RoundType
 
 
 class StartQueuedRoundRequest(BaseModel):
     queueEntryId: str = Field(min_length=1, max_length=80)
+    roundType: RoundType
 
 
 class DartEvent(BaseModel):
@@ -91,6 +105,18 @@ async def lifespan(_app: FastAPI):
     await db["queue"].create_index([("rollNo", 1), ("status", 1)])
     await db["game_rounds"].create_index([("rollNo", 1), ("status", 1), ("playedAt", -1)])
     await db["game_rounds"].create_index([("status", 1), ("playedAt", -1)])
+    # Safety net: the database itself refuses a second COMPLETED round of the same
+    # type for one participant. Legacy rounds (no roundType), in-progress and
+    # cancelled rounds are not covered by this partial index.
+    try:
+        await db["game_rounds"].create_index(
+            [("rollNo", 1), ("roundType", 1)],
+            unique=True,
+            name="uniq_completed_round_type",
+            partialFilterExpression={"status": "completed", "roundType": {"$type": "string"}},
+        )
+    except Exception as exc:  # e.g. pre-existing duplicate data; app still runs with the lock-based check
+        print(f"WARNING: could not create unique completed-round-type index: {exc}")
     print(f"Connected to MongoDB: {DB_NAME}.{STUDENTS_COLLECTION}")
     yield
     await client.close()
@@ -148,9 +174,68 @@ async def find_student(roll_no: str):
     }
 
 
+async def completed_round_types(roll_no: str) -> list:
+    """Round types this participant has completed (legacy untyped rounds are ignored)."""
+    found = await db["game_rounds"].distinct("roundType", {"rollNo": roll_no, "status": "completed"})
+    return [t for t in ROUND_TYPES if t in found]
+
+
+async def completed_types_by_roll(rolls: list) -> dict:
+    """{rollNo: [completed round types]} for many participants in one query."""
+    if not rolls:
+        return {}
+    cursor = await db["game_rounds"].aggregate([
+        {"$match": {"rollNo": {"$in": rolls}, "status": "completed"}},
+        {"$group": {"_id": "$rollNo", "types": {"$addToSet": "$roundType"}}},
+    ])
+    out = {}
+    for item in await cursor.to_list(length=None):
+        types = item.get("types") or []
+        out[item["_id"]] = [t for t in ROUND_TYPES if t in types]
+    return out
+
+
+def summarize_rounds(rounds: list) -> dict:
+    """Totals for a participant's COMPLETED rounds.
+
+    Legacy rounds without a valid roundType count towards the overall score and
+    round/dart counts, but not towards the static/linear/revolving totals."""
+    scores = {t: 0 for t in ROUND_TYPES}
+    done = set()
+    round_scores = []
+    total_darts = 0
+    for item in rounds:
+        score = int(item.get("roundScore") or 0)
+        round_scores.append(score)
+        total_darts += int(item.get("dartsReceived") or 0)
+        rtype = item.get("roundType")
+        if rtype in scores:
+            scores[rtype] += score
+            done.add(rtype)
+    total = sum(round_scores)
+    completed = [t for t in ROUND_TYPES if t in done]
+    return {
+        "overallScore": total,
+        "totalRounds": len(round_scores),
+        "totalDarts": total_darts,
+        "highestRoundScore": max(round_scores) if round_scores else 0,
+        "averageRoundScore": round(total / len(round_scores), 2) if round_scores else 0,
+        "staticScore": scores["static"],
+        "linearScore": scores["linear"],
+        "revolvingScore": scores["revolving"],
+        "completedRoundTypes": completed,
+        "remainingRoundTypes": [t for t in ROUND_TYPES if t not in done],
+        "isComplete": len(completed) == len(ROUND_TYPES),
+    }
+
+
 async def get_queue() -> list:
     cursor = db["queue"].find({"status": "waiting"}).sort("addedAt", 1)
-    return [serialize(d) async for d in cursor]
+    items = [serialize(d) async for d in cursor]
+    done = await completed_types_by_roll([i["rollNo"] for i in items if i.get("rollNo")])
+    for item in items:
+        item["completedRoundTypes"] = done.get(item.get("rollNo"), [])
+    return items
 
 
 async def get_stats() -> dict:
@@ -427,6 +512,11 @@ def check_darts_api_key(supplied_key: str):
     return None
 
 
+def _score_for_type(round_type: str) -> dict:
+    """$group accumulator: sum of roundScore for one round type (legacy/untyped rounds give 0)."""
+    return {"$sum": {"$cond": [{"$eq": ["$roundType", round_type]}, "$roundScore", 0]}}
+
+
 async def build_leaderboard(limit: int = 20, offset: int = 0) -> dict:
     """Rank players by cumulative score from completed rounds only."""
     pipeline = [
@@ -436,6 +526,10 @@ async def build_leaderboard(limit: int = 20, offset: int = 0) -> dict:
             "playerName": {"$first": "$playerName"},
             "personType": {"$first": {"$ifNull": ["$personType", "student"]}},
             "overallScore": {"$sum": "$roundScore"},
+            "staticScore": _score_for_type("static"),
+            "linearScore": _score_for_type("linear"),
+            "revolvingScore": _score_for_type("revolving"),
+            "roundTypes": {"$addToSet": "$roundType"},
             "totalRounds": {"$sum": 1},
             "highestRoundScore": {"$max": "$roundScore"},
             "averageRoundScore": {"$avg": "$roundScore"},
@@ -452,16 +546,23 @@ async def build_leaderboard(limit: int = 20, offset: int = 0) -> dict:
     facet = result[0] if result else {"players": [], "metadata": []}
     players = []
     for index, item in enumerate(facet.get("players", []), start=offset + 1):
+        types = item.get("roundTypes") or []
+        completed_types = [t for t in ROUND_TYPES if t in types]
         players.append({
             "rank": index,
             "rollNo": item["_id"],
             "playerName": item.get("playerName") or "(no name)",
             "personType": item.get("personType", "student"),
-            "overallScore": int(item.get("overallScore", 0)),
-            "totalRounds": int(item.get("totalRounds", 0)),
-            "totalDarts": int(item.get("totalDarts", 0)),
-            "highestRoundScore": int(item.get("highestRoundScore", 0)),
-            "averageRoundScore": round(float(item.get("averageRoundScore", 0)), 2),
+            "staticScore": int(item.get("staticScore") or 0),
+            "linearScore": int(item.get("linearScore") or 0),
+            "revolvingScore": int(item.get("revolvingScore") or 0),
+            "overallScore": int(item.get("overallScore") or 0),
+            "completedRoundTypes": completed_types,
+            "isComplete": len(completed_types) == len(ROUND_TYPES),
+            "totalRounds": int(item.get("totalRounds") or 0),
+            "totalDarts": int(item.get("totalDarts") or 0),
+            "highestRoundScore": int(item.get("highestRoundScore") or 0),
+            "averageRoundScore": round(float(item.get("averageRoundScore") or 0), 2),
         })
     metadata = facet.get("metadata", [])
     total_players = int(metadata[0]["totalPlayers"]) if metadata else 0
@@ -475,7 +576,7 @@ async def build_leaderboard(limit: int = 20, offset: int = 0) -> dict:
     }
 
 
-async def _start_round_for_player(roll_no: str, player_name: str, queue_entry: dict | None = None):
+async def _start_round_for_player(roll_no: str, player_name: str, round_type: str, queue_entry: dict | None = None):
     """Create one active round, optionally taking a specific waiting queue entry."""
     async with game_state_lock:
         active = await db["active_rounds"].find_one({"_id": "default"})
@@ -489,10 +590,24 @@ async def _start_round_for_player(roll_no: str, player_name: str, queue_entry: d
                         "roundId": str(active_round["_id"]),
                         "rollNumber": active_round["rollNo"],
                         "playerName": active_round["playerName"],
+                        "roundType": active_round.get("roundType"),
                         "dartsReceived": active_round.get("dartsReceived", 0),
                     },
                 }, status_code=409)
             await db["active_rounds"].delete_one({"_id": "default"})
+
+        # A participant may complete each round type only once.
+        done_types = await completed_round_types(roll_no)
+        if round_type in done_types:
+            if len(done_types) == len(ROUND_TYPES):
+                message = f"{player_name} has already completed all three round types."
+            else:
+                message = f"{player_name} has already completed the {round_type.title()} round. Choose a different round type."
+            return JSONResponse({
+                "ok": False,
+                "error": message,
+                "completedRoundTypes": done_types,
+            }, status_code=409)
 
         # If this player came from the queue, atomically claim that exact waiting entry.
         queue_entry_id = None
@@ -516,6 +631,7 @@ async def _start_round_for_player(roll_no: str, player_name: str, queue_entry: d
             "playerName": player_name,
             "personType": (queue_entry.get("personType") or "student") if queue_entry else "student",
             "roundNumber": previous_rounds + 1,
+            "roundType": round_type,
             "darts": [],
             "dartsReceived": 0,
             "roundScore": 0,
@@ -529,7 +645,7 @@ async def _start_round_for_player(roll_no: str, player_name: str, queue_entry: d
         round_id = result.inserted_id
         await db["active_rounds"].replace_one(
             {"_id": "default"},
-            {"_id": "default", "roundId": round_id, "rollNo": roll_no, "startedAt": now()},
+            {"_id": "default", "roundId": round_id, "rollNo": roll_no, "roundType": round_type, "startedAt": now()},
             upsert=True,
         )
 
@@ -543,6 +659,8 @@ async def _start_round_for_player(roll_no: str, player_name: str, queue_entry: d
         "playerName": player_name,
         "personType": (queue_entry.get("personType") or "student") if queue_entry else "student",
         "roundNumber": previous_rounds + 1,
+        "roundType": round_type,
+        "completedRoundTypes": done_types,
         "dartsReceived": 0,
         "dartsRemaining": 3,
         "status": "in_progress",
@@ -565,12 +683,13 @@ async def start_game_round(payload: StartRoundRequest):
         {"rollNo": student["rollNo"], "status": "waiting"},
         sort=[("addedAt", 1)],
     )
-    return await _start_round_for_player(student["rollNo"], student["name"], queue_entry)
+    return await _start_round_for_player(student["rollNo"], student["name"], payload.roundType.value, queue_entry)
 
 
 @app.post("/api/games/rounds/start-from-queue")
 async def start_game_round_from_queue(payload: StartQueuedRoundRequest):
     """Start the exact participant selected by the operator from the waiting queue."""
+    round_type = payload.roundType.value
     try:
         queue_entry_oid = ObjectId(payload.queueEntryId)
     except InvalidId:
@@ -619,6 +738,7 @@ async def start_game_round_from_queue(payload: StartQueuedRoundRequest):
         return await _start_round_for_player(
             outsider_id,
             queue_entry.get("name") or "Guest",
+            round_type,
             queue_entry,
         )
 
@@ -627,11 +747,13 @@ async def start_game_round_from_queue(payload: StartQueuedRoundRequest):
         return JSONResponse({"ok": False, "error": "The selected queue participant is not in the students database"}, status_code=404)
 
     # Use the exact selected queue entry; do not silently select the first matching entry.
-    return await _start_round_for_player(student["rollNo"], queue_entry.get("name") or student["name"], queue_entry)
+    return await _start_round_for_player(student["rollNo"], queue_entry.get("name") or student["name"], round_type, queue_entry)
 
 
 async def _record_dart_for_active_round(dart_fields: dict, source: str):
     """Record the next dart for the active round, regardless of input source."""
+    summary = None
+    queue_status = None
     async with game_state_lock:
         active = await db["active_rounds"].find_one({"_id": "default"})
         if not active:
@@ -646,6 +768,14 @@ async def _record_dart_for_active_round(dart_fields: dict, source: str):
                 {"ok": False, "error": "Active round was not found; start a new round"},
                 status_code=409,
             )
+
+        round_type = round_doc.get("roundType")
+        if round_type not in ROUND_TYPES:
+            # Round created before round types existed: it cannot be completed untyped.
+            return JSONResponse({
+                "ok": False,
+                "error": "The active round has no round type. Cancel it and start a new round with a round type selected.",
+            }, status_code=409)
 
         # Determine the next index from persisted round data, never from the request.
         existing_darts = list(round_doc.get("darts", []))
@@ -682,10 +812,16 @@ async def _record_dart_for_active_round(dart_fields: dict, source: str):
                 "completedAt": now(),
             })
 
-        update_result = await db["game_rounds"].update_one(
-            {"_id": round_doc["_id"], "status": "in_progress", "dartsReceived": stored_count},
-            {"$push": {"darts": dart}, "$set": update_fields},
-        )
+        try:
+            update_result = await db["game_rounds"].update_one(
+                {"_id": round_doc["_id"], "status": "in_progress", "dartsReceived": stored_count},
+                {"$push": {"darts": dart}, "$set": update_fields},
+            )
+        except DuplicateKeyError:
+            return JSONResponse({
+                "ok": False,
+                "error": f"This participant already has a completed {round_type.title()} round. Cancel this round and choose a different round type.",
+            }, status_code=409)
         if update_result.modified_count != 1:
             return JSONResponse({
                 "ok": False,
@@ -697,11 +833,25 @@ async def _record_dart_for_active_round(dart_fields: dict, source: str):
             await db["active_rounds"].delete_one(
                 {"_id": "default", "roundId": round_doc["_id"]}
             )
+            all_rounds = await db["game_rounds"].find(
+                {"rollNo": round_doc["rollNo"], "status": "completed"}
+            ).to_list(length=None)
+            summary = summarize_rounds(all_rounds)
             if round_doc.get("queueEntryId"):
-                await db["queue"].update_one(
-                    {"_id": round_doc["queueEntryId"], "status": "playing"},
-                    {"$set": {"status": "served", "doneAt": now()}},
-                )
+                if summary["isComplete"]:
+                    # All of Static, Linear and Revolving are done.
+                    await db["queue"].update_one(
+                        {"_id": round_doc["queueEntryId"], "status": "playing"},
+                        {"$set": {"status": "served", "doneAt": now()}},
+                    )
+                    queue_status = "served"
+                else:
+                    # Round types remain: back to waiting so the operator can pick them again.
+                    await db["queue"].update_one(
+                        {"_id": round_doc["queueEntryId"], "status": "playing"},
+                        {"$set": {"status": "waiting"}, "$unset": {"startedAt": ""}},
+                    )
+                    queue_status = "waiting"
 
     if completed and round_doc.get("queueEntryId"):
         await broadcast_queue()
@@ -712,6 +862,7 @@ async def _record_dart_for_active_round(dart_fields: dict, source: str):
         "rollNumber": round_doc["rollNo"],
         "playerName": round_doc["playerName"],
         "personType": round_doc.get("personType", "student"),
+        "roundType": round_type,
         "dartIndex": expected_index,
         "dartSource": source,
         "dartsReceived": darts_received,
@@ -720,17 +871,12 @@ async def _record_dart_for_active_round(dart_fields: dict, source: str):
     }
     if completed:
         response["roundScore"] = round_score
-        stats_cursor = await db["game_rounds"].aggregate([
-            {"$match": {"rollNo": round_doc["rollNo"], "status": "completed"}},
-            {"$group": {
-                "_id": "$rollNo",
-                "overallScore": {"$sum": "$roundScore"},
-                "totalRounds": {"$sum": 1},
-            }},
-        ])
-        stats = await stats_cursor.to_list(length=1)
-        response["overallScore"] = int(stats[0]["overallScore"]) if stats else round_score
-        response["totalRounds"] = int(stats[0]["totalRounds"]) if stats else 1
+        response["queueStatus"] = queue_status
+        response["overallScore"] = summary["overallScore"]
+        response["totalRounds"] = summary["totalRounds"]
+        for key in ("staticScore", "linearScore", "revolvingScore",
+                    "completedRoundTypes", "remainingRoundTypes", "isComplete"):
+            response[key] = summary[key]
         await broadcast("leaderboard", await build_leaderboard(limit=20, offset=0))
 
     return JSONResponse(response, status_code=201 if completed else 200)
@@ -801,6 +947,7 @@ async def cancel_game_round():
         "ok": True,
         "roundId": str(round_doc["_id"]),
         "rollNumber": round_doc["rollNo"],
+        "roundType": round_doc.get("roundType"),
         "status": "cancelled",
         "dartsReceived": int(round_doc.get("dartsReceived", 0)),
     }
@@ -820,6 +967,7 @@ async def get_player_scorecard(roll_no: str):
     student = await find_student(normalized_roll)
     if not student:
         # Allow a scorecard to remain available even if the source student record was removed.
+        # (This is also the path for outsiders, whose OUT-... IDs are not in the students collection.)
         any_round = await db["game_rounds"].find_one({"rollNo": normalized_roll, "status": "completed"})
         if not any_round:
             return JSONResponse({"ok": False, "error": "Player not found"}, status_code=404)
@@ -832,24 +980,16 @@ async def get_player_scorecard(roll_no: str):
     rounds = await db["game_rounds"].find(
         {"rollNo": normalized_roll, "status": "completed"}
     ).sort("playedAt", -1).to_list(length=None)
-    if not rounds:
-        return {
-            "ok": True,
-            "player": {"rollNo": normalized_roll, "playerName": player_name, "personType": person_type},
-            "stats": {"gamesPlayed": 0, "totalDarts": 0, "overallScore": 0, "highestRoundScore": 0, "averageRoundScore": 0},
-            "recentRounds": [],
-        }
 
-    scores = [int(item.get("roundScore", 0)) for item in rounds]
-    total_score = sum(scores)
-    total_rounds = len(rounds)
+    summary = summarize_rounds(rounds)
     recent_rounds = []
     for item in rounds[:10]:
         recent_rounds.append({
             "roundId": str(item["_id"]),
             "roundNumber": item.get("roundNumber"),
-            "roundScore": int(item.get("roundScore", 0)),
-            "dartsReceived": int(item.get("dartsReceived", 0)),
+            "roundType": item.get("roundType") if item.get("roundType") in ROUND_TYPES else None,
+            "roundScore": int(item.get("roundScore") or 0),
+            "dartsReceived": int(item.get("dartsReceived") or 0),
             "playedAt": item.get("playedAt").isoformat() if item.get("playedAt") else None,
             "completedAt": item.get("completedAt").isoformat() if item.get("completedAt") else None,
             "darts": [
@@ -861,14 +1001,7 @@ async def get_player_scorecard(roll_no: str):
     return {
         "ok": True,
         "player": {"rollNo": normalized_roll, "playerName": player_name, "personType": person_type},
-        "stats": {
-            "gamesPlayed": total_rounds,
-            "totalRounds": total_rounds,
-            "totalDarts": sum(int(item.get("dartsReceived", 0)) for item in rounds),
-            "overallScore": total_score,
-            "highestRoundScore": max(scores),
-            "averageRoundScore": round(total_score / total_rounds, 2),
-        },
+        "stats": {"gamesPlayed": summary["totalRounds"], **summary},
         "recentRounds": recent_rounds,
     }
 

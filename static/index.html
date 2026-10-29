@@ -129,6 +129,11 @@ tr.row{cursor:pointer}td.sc{font:700 18px var(--head)}td.rk{font:700 16px var(--
 .loadmore{text-align:center;margin-top:16px}
 .toast{position:fixed;right:20px;bottom:20px;max-width:380px;z-index:60;padding:12px 16px;font:13px var(--mono);line-height:1.5;background:var(--bg);border:1px solid var(--err);border-left:3px solid var(--err);color:var(--err);box-shadow:0 0 24px rgba(0,0,0,.6);opacity:0;transform:translateY(12px);pointer-events:none;transition:opacity .2s,transform .2s}
 .toast.show{opacity:1;transform:none}.toast.ok{border-color:var(--ok);color:var(--ok)}
+/* round types */
+.rtl{color:var(--muted);font:12px var(--mono);letter-spacing:.1em}
+.rtypes{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.rtypes .btn{padding:9px 4px;font-size:11px;letter-spacing:.08em}
+.badge.ok{border-color:rgba(57,255,136,.5);color:var(--ok)}
+.tgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:22px}@media(max-width:560px){.tgrid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -159,12 +164,14 @@ tr.row{cursor:pointer}td.sc{font:700 18px var(--head)}td.rk{font:700 16px var(--
       <div class="panel">
         <div class="ptitle"><span>// GAME CONTROL</span><span class="tag">START / CANCEL</span></div>
         <div class="outsider-form">
+          <div class="rtl">ROUND TYPE</div>
+          <div class="rtypes" id="rtypes"><button class="btn sm" type="button" data-rtype="static">Static</button><button class="btn sm" type="button" data-rtype="linear">Linear</button><button class="btn sm" type="button" data-rtype="revolving">Revolving</button></div>
           <label>PARTICIPANT ROLL NO<input id="cRoll" autocomplete="off" placeholder="ENTER ROLL NO"></label>
           <button class="btn solid" id="go">Start round</button>
           <button class="btn red" id="stop">Cancel round</button>
         </div>
         <div class="result" id="cmsg" aria-live="polite"></div>
-        <div class="hint">Use PLAY next to any waiting participant to start their round.</div>
+        <div class="hint">Pick the round type, then press Start round or PLAY next to any waiting participant. Each participant plays Static, Linear and Revolving once, in any order.</div>
       </div>
       <div class="panel">
         <div class="ptitle"><span>// MANUAL DART SCORE</span><span class="tag">OPENCV FALLBACK</span></div>
@@ -188,7 +195,9 @@ tr.row{cursor:pointer}td.sc{font:700 18px var(--head)}td.rk{font:700 16px var(--
         <div class="who" id="lName">Waiting for next participant</div>
         <div class="roll" id="lRoll"></div>
         <div class="slots" id="slots"></div>
-        <div class="tot"><div><b id="lTot">–</b><span id="lTotL">ROUND TOTAL (ON COMPLETION)</span></div><div><b id="lCum">–</b><span>CUMULATIVE (COMPLETED ROUNDS)</span></div><div class="cnt"><b id="lCnt">0/3</b><span>DARTS RECEIVED</span></div></div>
+        <div class="tot"><div><b id="lTot">–</b><span id="lTotL">ROUND TOTAL (ON COMPLETION)</span></div><div><b id="lCum">–</b><span>OVERALL SCORE (COMPLETED ROUNDS)</span></div><div class="cnt"><b id="lCnt">0/3</b><span>DARTS RECEIVED</span></div></div>
+        <div class="tot" id="lTypes" style="margin-top:18px"></div>
+        <div class="note" id="lProg"></div>
         <div class="note" id="lNote" hidden>Automatic (OpenCV) darts are not pushed to this page by the backend. The count refreshes when you submit a manual dart or when the round completes.</div>
         <div class="qactions" style="margin-top:16px">
           <button class="btn sm" id="lCard" data-card="" hidden>View scorecard</button>
@@ -209,7 +218,7 @@ tr.row{cursor:pointer}td.sc{font:700 18px var(--head)}td.rk{font:700 16px var(--
     <div class="pod" id="pod"></div>
     <div class="panel">
       <div class="ptitle"><span>// LEADERBOARD</span><span class="tag" id="lbTag">CUMULATIVE SCORE</span></div>
-      <div class="tablewrap"><table><thead><tr><th>RANK</th><th>NAME</th><th class="hs">ID</th><th>TOTAL</th><th>ROUNDS</th><th class="hs">BEST</th><th class="hs">AVG</th><th class="hs">DARTS</th></tr></thead><tbody id="lbb"></tbody></table></div>
+      <div class="tablewrap"><table><thead><tr><th>RANK</th><th>NAME</th><th class="hs">ID</th><th>STATIC</th><th>LINEAR</th><th>REVOLVING</th><th>OVERALL</th><th>ROUNDS</th><th class="hs">BEST</th><th class="hs">AVG</th><th class="hs">DARTS</th></tr></thead><tbody id="lbb"></tbody></table></div>
       <div class="empty" id="lbe">[ LOADING LEADERBOARD… ]</div>
       <div class="loadmore" id="lbMore" hidden><button class="btn sm" data-more="1">Load more</button></div>
     </div>
@@ -265,6 +274,10 @@ const hhmm=d=>d?new Date(d).toLocaleTimeString([],{hour:"2-digit",minute:"2-digi
 const hhmmss=(d=new Date())=>d.toLocaleTimeString([],{hour12:false});
 const isOut=r=>/^OUT-/i.test(r||"");
 const shortId=r=>isOut(r)?"OUT-…"+String(r).slice(-6):String(r||"");
+const RTL={static:"Static",linear:"Linear",revolving:"Revolving"},RKEYS=Object.keys(RTL);
+const RTU=t=>(RTL[t]||"").toUpperCase();
+const doneOf=q=>Array.isArray(q&&q.completedRoundTypes)?q.completedRoundTypes:[];
+const progTxt=q=>{const d=doneOf(q);return d.length?`${d.length}/3 DONE: ${d.map(RTU).join(", ")}`:"NO ROUNDS YET";};
 const idLabel=q=>q.personType==="outsider"?`OUTSIDER · ${q.role||"—"}`:String(q.rollNo||"");
 const store={get(k){try{return sessionStorage.getItem(k);}catch(e){return null;}},set(k,v){try{v==null?sessionStorage.removeItem(k):sessionStorage.setItem(k,v);}catch(e){}}};
 
@@ -289,8 +302,10 @@ function errMsg(r){
 setInterval(()=>$("clock").textContent=hhmmss(),1000);$("clock").textContent=hhmmss();
 
 /* ---------- state ---------- */
-const S={round:null,queue:[],qState:"loading",lb:[],lbTotal:0,lbState:"loading",sse:false};
+const S={round:null,queue:[],qState:"loading",lb:[],lbTotal:0,lbState:"loading",sse:false,rtype:"static"};
 let busy=false;store.set("rs_key",null); // clears any key an older version of this page stored in this tab
+{const sv=store.get("rs_rtype");if(RTL[sv])S.rtype=sv;}
+function drawRT(){document.querySelectorAll("[data-rtype]").forEach(b=>b.classList.toggle("on",b.dataset.rtype===S.rtype));}
 const isAct=()=>!!S.round&&S.round.status==="in_progress";
 function setRound(r){S.round=r;store.set("rs_round",r?JSON.stringify(r):null);}
 try{S.round=JSON.parse(store.get("rs_round")||"null");}catch(e){S.round=null;}
@@ -313,25 +328,25 @@ function show(t){
 }
 
 /* ---------- round model (values come from backend responses) ---------- */
-const fromStart=d=>({id:d.roundId,roll:d.rollNumber,name:d.playerName,type:d.personType||(isOut(d.rollNumber)?"outsider":"student"),num:d.roundNumber??null,status:"in_progress",n:d.dartsReceived??0,darts:{},total:null,cum:null});
-const fromActive=a=>({id:a.roundId,roll:a.rollNumber,name:a.playerName,type:isOut(a.rollNumber)?"outsider":"student",num:null,status:"in_progress",n:a.dartsReceived??0,darts:{},total:null,cum:null});
+const fromStart=d=>({id:d.roundId,roll:d.rollNumber,name:d.playerName,type:d.personType||(isOut(d.rollNumber)?"outsider":"student"),num:d.roundNumber??null,rt:d.roundType||null,st:null,status:"in_progress",n:d.dartsReceived??0,darts:{},total:null,cum:null});
+const fromActive=a=>({id:a.roundId,roll:a.rollNumber,name:a.playerName,type:isOut(a.rollNumber)?"outsider":"student",num:null,rt:a.roundType||null,st:null,status:"in_progress",n:a.dartsReceived??0,darts:{},total:null,cum:null});
 
 async function scorecardInfo(R){
   const r=await api("/api/players/"+encodeURIComponent(R.roll)+"/scorecard");
-  if(r.status===404)return{stats:{overallScore:0},round:null};   // brand-new participant: no completed rounds yet
+  if(r.status===404)return{stats:{overallScore:0,completedRoundTypes:[],isComplete:false},round:null};   // brand-new participant: no completed rounds yet
   if(r.status!==200)return null;
   return{stats:r.data.stats,round:(r.data.recentRounds||[]).find(x=>x.roundId===R.id)||null};
 }
 async function loadCum(R){
   const h=await scorecardInfo(R);
-  if(h&&S.round&&S.round.id===R.id&&S.round.cum==null){S.round.cum=h.stats.overallScore;setRound(S.round);draw();}
+  if(h&&S.round&&S.round.id===R.id&&S.round.cum==null){S.round.cum=h.stats.overallScore;S.round.st=h.stats;setRound(S.round);draw();}
 }
 function applyCompleted(R,x,stats){
   const was=R.status;
-  R.status="completed";R.total=x.roundScore;R.n=x.dartsReceived;R.num=x.roundNumber??R.num;R.cum=stats.overallScore;
+  R.status="completed";R.total=x.roundScore;R.n=x.dartsReceived;R.num=x.roundNumber??R.num;R.cum=stats.overallScore;R.rt=x.roundType||R.rt;R.st=stats;
   R.darts={};(x.darts||[]).forEach(d=>{R.darts[d.dart_index]={score:d.score,src:d.source||"stored"};});
   setRound(R);
-  if(was==="in_progress")log("ok",`${R.name||R.roll} finished round: ${x.roundScore}`);
+  if(was==="in_progress")log("ok",`${R.name||R.roll} finished ${RTU(R.rt)} round: ${x.roundScore}`);
 }
 let recBusy=false;
 async function reconcile(final){
@@ -355,7 +370,7 @@ function rLive(){
   $("live").className="panel live "+(act?"act":done?"done":"");
   $("lState").textContent=act?"ROUND IN PROGRESS":done?"ROUND COMPLETE":R&&R.status==="cancelled"?"ROUND CANCELLED":R&&R.status==="ended"?"ROUND ENDED · NOT COMPLETED":"NO ACTIVE ROUND";
   $("lName").innerHTML=R?esc(R.name||R.roll)+(R.type==="outsider"?'<span class="badge">Outsider</span>':""):"Waiting for next participant";
-  $("lRoll").textContent=R?`${shortId(R.roll)}${R.num?" · ROUND "+R.num:""}`:"PICK A PARTICIPANT FROM THE QUEUE";
+  $("lRoll").textContent=R?`${shortId(R.roll)}${R.rt?" · "+RTU(R.rt):""}${R.num?" · ROUND "+R.num:""}`:"PICK A PARTICIPANT FROM THE QUEUE";
   $("lRoll").title=R?R.roll:"";
   const n=R?R.n:0,known=R?R.darts:{};
   $("slots").innerHTML=[1,2,3].map(i=>{
@@ -366,6 +381,9 @@ function rLive(){
   $("lTot").textContent=done&&R.total!=null?R.total:"–";
   $("lTotL").textContent=done?"ROUND TOTAL":"ROUND TOTAL (ON COMPLETION)";
   $("lCum").textContent=R&&R.cum!=null?R.cum:"–";
+  const st=R&&R.st,dn=st&&Array.isArray(st.completedRoundTypes)?st.completedRoundTypes:[];
+  $("lTypes").innerHTML=RKEYS.map(t=>`<div><b>${dn.includes(t)?esc(st[t+"Score"]):"–"}</b><span>${RTU(t)}${act&&R.rt===t?" ◂ NOW":""}</span></div>`).join("");
+  $("lProg").textContent=R&&st?(st.isComplete?"ALL 3 ROUND TYPES COMPLETE":`${dn.length}/3 ROUND TYPES COMPLETE`):"";
   $("lCnt").textContent=`${R?Math.min(3,R.n):0}/3`;
   $("lNote").hidden=!act;
   $("lCard").hidden=!R;$("lCard").dataset.card=R?R.roll:"";
@@ -374,7 +392,7 @@ function rLive(){
 }
 function rManual(){
   const R=S.round,a=isAct();
-  $("mWho").textContent=a?(R.name||R.roll):"No active round";
+  $("mWho").textContent=a?(R.name||R.roll)+(R.rt?" · "+RTU(R.rt):""):"No active round";
   $("mDart").textContent=a?(R.n>=3?"—":`${R.n+1} / 3`):"—";
   $("mBtn").textContent=a&&R.n<3?`Submit dart ${R.n+1}`:"Submit score";
   $("mHint").textContent=a
@@ -384,7 +402,7 @@ function rManual(){
 function rCtl(){
   const a=isAct(),full=a&&S.round.n>=3;
   $("go").disabled=a||busy;$("cRoll").disabled=a||busy;$("stop").disabled=busy;
-  document.querySelectorAll("[data-play]").forEach(b=>b.disabled=a||busy);
+  document.querySelectorAll("[data-play]").forEach(b=>{const q=S.queue.find(x=>x._id===b.dataset.play);b.disabled=a||busy||doneOf(q).includes(S.rtype);});
   $("mScore").disabled=!a||busy||full;$("mBtn").disabled=!a||busy||full;
 }
 function draw(){rLive();rManual();rCtl();}
@@ -395,13 +413,13 @@ async function run(fn){if(busy)return;busy=true;rCtl();try{await fn();}finally{b
 function afterStart(r){
   if(r.status===201){
     const R=fromStart(r.data);setRound(R);loadCum(R);$("cRoll").value="";
-    gmsg(`Round ${R.num} started for ${R.name}. Waiting for darts.`,true);
-    log("ok",`ROUND STARTED › ${R.name}`);
+    gmsg(`${R.rt?RTL[R.rt]+" round":"Round "+R.num} started for ${R.name}. Waiting for darts.`,true);
+    log("ok",`ROUND STARTED › ${R.name} › ${RTU(R.rt)}`);
   }else if(r.status===409&&r.data.activeRound){
     const a=r.data.activeRound;
     if(S.round&&S.round.id===a.roundId&&S.round.status==="in_progress"){S.round.n=a.dartsReceived??S.round.n;setRound(S.round);}
     else{setRound(fromActive(a));loadCum(S.round);}
-    gmsg(`A round is already in progress for ${a.playerName} (${a.dartsReceived??0}/3 darts). Finish or cancel it first.`);
+    gmsg(`A round is already in progress for ${a.playerName} (${a.roundType?RTU(a.roundType)+", ":""}${a.dartsReceived??0}/3 darts). Finish or cancel it first.`);
   }else{
     gmsg(errMsg(r));
     if(r.status===404||r.status===409)loadQueue();
@@ -410,10 +428,10 @@ function afterStart(r){
 $("go").onclick=()=>run(async()=>{
   const roll=$("cRoll").value.trim();
   if(!roll)return gmsg("Enter the participant's roll number.");
-  afterStart(await api("/api/games/rounds/start",{method:"POST",body:JSON.stringify({rollNumber:roll})}));
+  afterStart(await api("/api/games/rounds/start",{method:"POST",body:JSON.stringify({rollNumber:roll,roundType:S.rtype})}));
 });
 const playEntry=id=>run(async()=>{
-  afterStart(await api("/api/games/rounds/start-from-queue",{method:"POST",body:JSON.stringify({queueEntryId:id})}));
+  afterStart(await api("/api/games/rounds/start-from-queue",{method:"POST",body:JSON.stringify({queueEntryId:id,roundType:S.rtype})}));
 });
 $("stop").onclick=()=>run(async()=>{
   if(!confirm("Cancel the active round? Darts already received will not count, and a queued participant goes back to waiting."))return;
@@ -446,18 +464,18 @@ $("mForm").addEventListener("submit",e=>{
     const d=r.data;let warn="";
     if(d.roundId!==R.id){
       warn=`This dart was recorded for ${d.playerName} (a different round than the one shown). `;
-      setRound({...fromActive({roundId:d.roundId,rollNumber:d.rollNumber,playerName:d.playerName,dartsReceived:d.dartsReceived}),type:d.personType||"student"});loadCum(S.round);
+      setRound({...fromActive({roundId:d.roundId,rollNumber:d.rollNumber,playerName:d.playerName,dartsReceived:d.dartsReceived,roundType:d.roundType}),type:d.personType||"student"});loadCum(S.round);
     }else if(d.dartIndex!==expected){
       warn=`The backend recorded this as dart ${d.dartIndex}, not ${expected}; an automatic dart arrived in the meantime. `;
     }
     const cur=S.round;cur.n=d.dartsReceived;cur.darts[d.dartIndex]={score,src:"manual"};
     if(d.roundCompleted){
-      cur.status="completed";cur.total=d.roundScore;cur.cum=d.overallScore;
-      log("ok",`${cur.name||cur.roll} finished round: ${d.roundScore}`);
+      cur.status="completed";cur.total=d.roundScore;cur.cum=d.overallScore;cur.st=d;
+      log("ok",`${cur.name||cur.roll} finished ${RTU(cur.rt)} round: ${d.roundScore}`);
     }
     setRound(cur);
     $("mScore").value="";
-    toMsg("mmsg",`${warn}Dart ${d.dartIndex} saved for ${d.playerName}.${d.roundCompleted?` Round complete: ${d.roundScore}.`:` ${d.dartsRemaining} dart${d.dartsRemaining===1?"":"s"} remaining.`}`,warn?"warn":true);
+    toMsg("mmsg",`${warn}Dart ${d.dartIndex} saved for ${d.playerName}.${d.roundCompleted?` Round complete: ${d.roundScore}.${d.queueStatus==="served"?" All three round types done.":d.queueStatus==="waiting"?" Back in the queue for the remaining round types.":""}`:` ${d.dartsRemaining} dart${d.dartsRemaining===1?"":"s"} remaining.`}`,warn?"warn":true);
     log("ok",`DART ${d.dartIndex} › MANUAL › ${score}`);
     if(d.roundCompleted)fillDarts(cur);
   }).then(()=>{if(isAct())$("mScore").focus();});
@@ -485,8 +503,10 @@ function rLB(){
   $("lbTag").textContent=st==="stale"||st==="err"?"OFFLINE · LAST KNOWN DATA":`CUMULATIVE SCORE · ${S.lbTotal} PLAYERS`;
   $("lbMore").hidden=!(L.length&&L.length<S.lbTotal);
   const top=L.filter(p=>p.rank<=3);
-  $("pod").innerHTML=top.map(p=>`<div class="panel pc r${p.rank}" data-card="${esc(p.rollNo)}"><div class="rk">RANK ${p.rank}</div><div class="nm">${esc(p.playerName)}</div><div style="font:13px var(--mono);color:var(--muted)">${esc(shortId(p.rollNo))} · ${p.totalRounds} ROUNDS</div><div class="sc">${p.overallScore}</div></div>`).join("");
-  $("lbb").innerHTML=L.map(p=>`<tr class="row ${p.rank<4?"r"+p.rank:""}" data-card="${esc(p.rollNo)}"><td class="rk">${p.rank}</td><td>${esc(p.playerName)}${p.personType==="outsider"?'<span class="badge">Outsider</span>':""}</td><td class="mono hs" title="${esc(p.rollNo)}">${esc(shortId(p.rollNo))}</td><td class="sc">${p.overallScore}</td><td>${p.totalRounds}</td><td class="hs">${p.highestRoundScore}</td><td class="hs">${p.averageRoundScore}</td><td class="hs">${p.totalDarts}</td></tr>`).join("");
+  const ty=(p,t)=>(p.completedRoundTypes||[]).includes(t)?p[t+"Score"]:"–";
+  const stat=p=>p.isComplete?'<span class="badge ok">Complete</span>':`<span class="badge">${(p.completedRoundTypes||[]).length}/3</span>`;
+  $("pod").innerHTML=top.map(p=>`<div class="panel pc r${p.rank}" data-card="${esc(p.rollNo)}"><div class="rk">RANK ${p.rank}</div><div class="nm">${esc(p.playerName)}</div><div style="font:13px var(--mono);color:var(--muted)">${esc(shortId(p.rollNo))} · ${p.totalRounds} ROUNDS ${stat(p)}</div><div style="font:12px var(--mono);color:var(--muted);margin-top:4px">S ${ty(p,"static")} · L ${ty(p,"linear")} · R ${ty(p,"revolving")}</div><div class="sc">${p.overallScore}</div></div>`).join("");
+  $("lbb").innerHTML=L.map(p=>`<tr class="row ${p.rank<4?"r"+p.rank:""}" data-card="${esc(p.rollNo)}"><td class="rk">${p.rank}</td><td>${esc(p.playerName)}${p.personType==="outsider"?'<span class="badge">Outsider</span>':""}${stat(p)}</td><td class="mono hs" title="${esc(p.rollNo)}">${esc(shortId(p.rollNo))}</td><td>${ty(p,"static")}</td><td>${ty(p,"linear")}</td><td>${ty(p,"revolving")}</td><td class="sc">${p.overallScore}</td><td>${p.totalRounds}</td><td class="hs">${p.highestRoundScore}</td><td class="hs">${p.averageRoundScore}</td><td class="hs">${p.totalDarts}</td></tr>`).join("");
   $("mini").innerHTML=top.map(p=>`<div class="mini r${p.rank}"><span class="rk">${p.rank}</span>${esc(p.playerName)}<b>${p.overallScore}</b></div>`).join("")||`<div class="hint">${st==="err"?"LEADERBOARD UNAVAILABLE":st==="loading"?"LOADING…":"NO SCORES YET"}</div>`;
 }
 
@@ -498,11 +518,12 @@ async function card(roll){
   const r=await api("/api/players/"+encodeURIComponent(roll)+"/scorecard");
   if(tok!==scTok)return;
   if(r.status!==200)return $("scOut").innerHTML=`<div class="result"><div class="msg">${esc(errMsg(r)).toUpperCase()}</div></div>`;
-  const s=r.data.stats,p=r.data.player,R=r.data.recentRounds||[];
-  $("scOut").innerHTML=`<div class="panel" style="margin-bottom:22px"><div class="ptitle"><span>// PLAYER</span><span class="tag" title="${esc(p.rollNo)}">${esc(p.personType==="outsider"?"OUTSIDER · "+shortId(p.rollNo):p.rollNo)}</span></div><div style="font:900 28px var(--head);word-break:break-word">${esc(p.playerName)}</div></div>
+  const s=r.data.stats,p=r.data.player,R=r.data.recentRounds||[],dn=s.completedRoundTypes||[];
+  $("scOut").innerHTML=`<div class="panel" style="margin-bottom:22px"><div class="ptitle"><span>// PLAYER</span><span class="tag" title="${esc(p.rollNo)}">${esc(p.personType==="outsider"?"OUTSIDER · "+shortId(p.rollNo):p.rollNo)}</span></div><div style="font:900 28px var(--head);word-break:break-word">${esc(p.playerName)}${s.isComplete?'<span class="badge ok">All 3 rounds complete</span>':`<span class="badge">${dn.length}/3 round types</span>`}</div></div>
   <div class="sgrid">${[[s.overallScore,"OVERALL SCORE","c"],[s.gamesPlayed,"ROUNDS PLAYED",""],[s.averageRoundScore,"AVERAGE ROUND",""],[s.highestRoundScore,"HIGHEST ROUND","g"]].map(x=>`<div class="panel stat"><div class="k">${x[1]}</div><div class="v ${x[2]}">${x[0]}</div></div>`).join("")}</div>
+  <div class="tgrid">${RKEYS.map(t=>`<div class="panel stat"><div class="k">${RTU(t)}</div><div class="v">${dn.includes(t)?s[t+"Score"]:"–"}</div><div class="note">${dn.includes(t)?"COMPLETED":"NOT PLAYED"}</div></div>`).join("")}</div>
   <div class="panel"><div class="ptitle"><span>// ROUND HISTORY</span><span class="tag">LATEST 10 · ${s.totalDarts||0} DARTS TOTAL</span></div>
-  ${R.map(x=>`<div class="rd"><b style="font-family:var(--head)">R${x.roundNumber}</b>${[1,2,3].map(i=>{const d=(x.darts||[]).find(z=>z.dart_index===i);return`<div class="dc"><small>DART ${i}${d&&d.source==="manual"?" · MANUAL":""}</small>${d?esc(d.score):"–"}</div>`;}).join("")}<span class="t">${hhmm(x.completedAt)}</span><div class="rs">${x.roundScore}</div></div>`).join("")||'<div class="empty">[ NO COMPLETED ROUNDS YET ]</div>'}</div>`;
+  ${R.map(x=>`<div class="rd"><b style="font-family:var(--head);min-width:110px">${x.roundType?RTU(x.roundType):"R"+x.roundNumber}</b>${[1,2,3].map(i=>{const d=(x.darts||[]).find(z=>z.dart_index===i);return`<div class="dc"><small>DART ${i}${d&&d.source==="manual"?" · MANUAL":""}</small>${d?esc(d.score):"–"}</div>`;}).join("")}<span class="t">${hhmm(x.completedAt)}</span><div class="rs">${x.roundScore}</div></div>`).join("")||'<div class="empty">[ NO COMPLETED ROUNDS YET ]</div>'}</div>`;
 }
 $("scForm").addEventListener("submit",e=>{e.preventDefault();const v=$("scRoll").value.trim();if(v)card(v);});
 
@@ -530,10 +551,10 @@ function drawQueue(){
   const rest=items.slice(1);
   $("empty").style.display=rest.length?"none":"block";
   $("empty").innerHTML=st==="err"?'[ COULD NOT LOAD QUEUE ]<br><br><button class="btn sm" data-retry="q">Retry</button>':st==="loading"?"[ LOADING QUEUE… ]":"[ NO ONE ELSE WAITING ]";
-  $("qbody").innerHTML=rest.map((q,i)=>`<tr><td class="pos">#${String(i+2).padStart(2,"0")}</td><td>${esc(q.name)}${q.personType==="outsider"?'<span class="badge">Outsider</span>':""}</td><td class="mono" title="${esc(q.rollNo)}">${esc(idLabel(q))}${q.personType==="outsider"?`<br><span style="color:var(--muted);font-size:12px">${esc(shortId(q.rollNo))}</span>`:""}</td><td class="src"><span class="${q.source==="manual"?"manual":""}">${esc(q.source)}</span></td><td class="time">${hhmm(q.addedAt)}</td>
+  $("qbody").innerHTML=rest.map((q,i)=>`<tr><td class="pos">#${String(i+2).padStart(2,"0")}</td><td>${esc(q.name)}${q.personType==="outsider"?'<span class="badge">Outsider</span>':""}</td><td class="mono" title="${esc(q.rollNo)}">${esc(idLabel(q))}${q.personType==="outsider"?`<br><span style="color:var(--muted);font-size:12px">${esc(shortId(q.rollNo))}</span>`:""}<br><span style="color:var(--muted);font-size:12px">${esc(progTxt(q))}</span></td><td class="src"><span class="${q.source==="manual"?"manual":""}">${esc(q.source)}</span></td><td class="time">${hhmm(q.addedAt)}</td>
   <td class="btns">${play(q)}<button class="btn green sm" data-id="${esc(q._id)}" data-act="served">Done</button><button class="btn red sm" data-id="${esc(q._id)}" data-act="removed">✕</button></td></tr>`).join("");
   // compact queue on the Live tab: every waiting participant can be selected
-  $("lq").innerHTML=items.map((q,i)=>`<div class="lqrow"><span class="p">#${String(i+1).padStart(2,"0")}</span><div style="min-width:0"><div class="n">${esc(q.name)}${q.personType==="outsider"?'<span class="badge">Outsider</span>':""}</div><div class="i" title="${esc(q.rollNo)}">${esc(idLabel(q))}${q.personType==="outsider"?" · "+esc(shortId(q.rollNo)):""}</div></div>${play(q)}</div>`).join("");
+  $("lq").innerHTML=items.map((q,i)=>`<div class="lqrow"><span class="p">#${String(i+1).padStart(2,"0")}</span><div style="min-width:0"><div class="n">${esc(q.name)}${q.personType==="outsider"?'<span class="badge">Outsider</span>':""}</div><div class="i" title="${esc(q.rollNo)}">${esc(idLabel(q))}${q.personType==="outsider"?" · "+esc(shortId(q.rollNo)):""}</div><div class="i">${esc(progTxt(q))}</div></div>${play(q)}</div>`).join("");
   $("lqEmpty").style.display=items.length?"none":"block";
   $("lqEmpty").innerHTML=st==="err"?'[ COULD NOT LOAD QUEUE ]<br><br><button class="btn sm" data-retry="q">Retry</button>':st==="loading"?"[ LOADING QUEUE… ]":"[ NO ONE IS WAITING ]";
   rCtl();
@@ -541,6 +562,7 @@ function drawQueue(){
 
 document.addEventListener("click",e=>{
   const t=e.target.closest("[data-tab]");if(t)return show(t.dataset.tab);
+  const rb=e.target.closest("[data-rtype]");if(rb){S.rtype=rb.dataset.rtype;store.set("rs_rtype",S.rtype);drawRT();drawQueue();return;}
   const rt=e.target.closest("[data-retry]");
   if(rt){if(rt.dataset.retry==="lb"){S.lbState="loading";rLB();return loadLB();}S.qState="loading";drawQueue();return loadQueue();}
   if(e.target.closest("[data-more]"))return loadLB(true);
@@ -642,7 +664,7 @@ $("nextBtn").onclick=()=>api("/api/queue/next",{method:"POST"}).then(()=>{if(!S.
 $("clearBtn").onclick=()=>{if(confirm("Clear the whole queue?"))api("/api/queue",{method:"DELETE"}).then(()=>{if(!S.sse)loadQueue();});};
 
 /* ---------- boot ---------- */
-draw();rLB();drawQueue();loadQueue();loadLB();connect();reconcile(false);
+drawRT();draw();rLB();drawQueue();loadQueue();loadLB();connect();reconcile(false);
 </script>
 </body>
 </html>
