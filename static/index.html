@@ -171,7 +171,7 @@ tr.row{cursor:pointer}td.sc{font:700 18px var(--head)}td.rk{font:700 16px var(--
           <button class="btn red" id="stop">Cancel round</button>
         </div>
         <div class="result" id="cmsg" aria-live="polite"></div>
-        <div class="hint">Pick the round type, then press Start round or PLAY next to any waiting participant. Each participant plays Static, Linear and Revolving once, in any order.</div>
+        <div class="hint">For queued participants, PLAY automatically selects their next unfinished round in order: Static → Linear → Revolving. Use the selector only when starting directly by roll number.</div>
       </div>
       <div class="panel">
         <div class="ptitle"><span>// MANUAL DART SCORE</span><span class="tag">OPENCV FALLBACK</span></div>
@@ -201,6 +201,7 @@ tr.row{cursor:pointer}td.sc{font:700 18px var(--head)}td.rk{font:700 16px var(--
         <div class="note" id="lNote" hidden>Automatic (OpenCV) darts are not pushed to this page by the backend. The count refreshes when you submit a manual dart or when the round completes.</div>
         <div class="qactions" style="margin-top:16px">
           <button class="btn sm" id="lCard" data-card="" hidden>View scorecard</button>
+          <button class="btn sm red" id="lRemove" hidden title="Remove this participant and cancel their active round">Remove participant</button>
           <button class="btn sm red" id="lClear" hidden title="Clears this display only; the server is not changed">Dismiss</button>
         </div>
       </div>
@@ -328,8 +329,8 @@ function show(t){
 }
 
 /* ---------- round model (values come from backend responses) ---------- */
-const fromStart=d=>({id:d.roundId,roll:d.rollNumber,name:d.playerName,type:d.personType||(isOut(d.rollNumber)?"outsider":"student"),num:d.roundNumber??null,rt:d.roundType||null,st:null,status:"in_progress",n:d.dartsReceived??0,darts:{},total:null,cum:null});
-const fromActive=a=>({id:a.roundId,roll:a.rollNumber,name:a.playerName,type:isOut(a.rollNumber)?"outsider":"student",num:null,rt:a.roundType||null,st:null,status:"in_progress",n:a.dartsReceived??0,darts:{},total:null,cum:null});
+const fromStart=d=>({id:d.roundId,roll:d.rollNumber,name:d.playerName,type:d.personType||(isOut(d.rollNumber)?"outsider":"student"),queueEntryId:d.queueEntryId||null,num:d.roundNumber??null,rt:d.roundType||null,st:null,status:"in_progress",n:d.dartsReceived??0,darts:{},total:null,cum:null});
+const fromActive=a=>({id:a.roundId,roll:a.rollNumber,name:a.playerName,type:isOut(a.rollNumber)?"outsider":"student",queueEntryId:a.queueEntryId||null,num:null,rt:a.roundType||null,st:null,status:"in_progress",n:a.dartsReceived??0,darts:{},total:null,cum:null});
 
 async function scorecardInfo(R){
   const r=await api("/api/players/"+encodeURIComponent(R.roll)+"/scorecard");
@@ -387,6 +388,7 @@ function rLive(){
   $("lCnt").textContent=`${R?Math.min(3,R.n):0}/3`;
   $("lNote").hidden=!act;
   $("lCard").hidden=!R;$("lCard").dataset.card=R?R.roll:"";
+  $("lRemove").hidden=!(act&&R&&R.queueEntryId);$("lRemove").disabled=busy;
   $("lClear").hidden=!R;
   $("lNext").textContent=nx?`NEXT: ${nx.name} · ${S.queue.length} WAITING`:"QUEUE EMPTY";
 }
@@ -402,7 +404,7 @@ function rManual(){
 function rCtl(){
   const a=isAct(),full=a&&S.round.n>=3;
   $("go").disabled=a||busy;$("cRoll").disabled=a||busy;$("stop").disabled=busy;
-  document.querySelectorAll("[data-play]").forEach(b=>{const q=S.queue.find(x=>x._id===b.dataset.play);b.disabled=a||busy||doneOf(q).includes(S.rtype);});
+  document.querySelectorAll("[data-play]").forEach(b=>{b.disabled=a||busy;});
   $("mScore").disabled=!a||busy||full;$("mBtn").disabled=!a||busy||full;
 }
 function draw(){rLive();rManual();rCtl();}
@@ -431,7 +433,8 @@ $("go").onclick=()=>run(async()=>{
   afterStart(await api("/api/games/rounds/start",{method:"POST",body:JSON.stringify({rollNumber:roll,roundType:S.rtype})}));
 });
 const playEntry=id=>run(async()=>{
-  afterStart(await api("/api/games/rounds/start-from-queue",{method:"POST",body:JSON.stringify({queueEntryId:id,roundType:S.rtype})}));
+  // The backend chooses this participant’s next unfinished round (Static → Linear → Revolving).
+  afterStart(await api("/api/games/rounds/start-from-queue",{method:"POST",body:JSON.stringify({queueEntryId:id})}));
 });
 $("stop").onclick=()=>run(async()=>{
   if(!confirm("Cancel the active round? Darts already received will not count, and a queued participant goes back to waiting."))return;
@@ -444,6 +447,18 @@ $("stop").onclick=()=>run(async()=>{
     gmsg(errMsg(r));
     if(r.status===404||r.status===409)await reconcile(true);
   }
+});
+$("lRemove").onclick=()=>run(async()=>{
+  const R=S.round;
+  if(!R||!R.queueEntryId)return;
+  if(!confirm(`Remove ${R.name||R.roll} from the event? Their current unfinished round will be cancelled.`))return;
+  const r=await api(`/api/queue/${encodeURIComponent(R.queueEntryId)}`,{method:"PATCH",body:JSON.stringify({status:"removed"})});
+  if(r.status===200){
+    R.status="cancelled";setRound(R);
+    gmsg(`${R.name||R.roll} removed from the event.`,true);
+    log("warn",`PARTICIPANT REMOVED › ${R.name||R.roll}`);
+    await loadQueue();
+  }else gmsg(errMsg(r));
 });
 $("lClear").onclick=()=>{setRound(null);draw();};
 
@@ -538,7 +553,7 @@ function drawQueue(){
   const items=S.queue,st=S.qState;
   $("sQueue").textContent=st==="ok"?items.length:"–";
   $("nextBtn").disabled=!items.length;$("clearBtn").disabled=!items.length;
-  const play=q=>`<button class="btn sm" data-play="${esc(q._id)}">Play</button>`;
+  const play=q=>`<button class="btn sm" data-play="${esc(q._id)}">Play ${esc(RTL[q.nextRoundType]||RTL[(doneOf(q).length===0?"static":doneOf(q).length===1?"linear":"revolving")]||"Next")}</button>`;
   const first=items[0],box=$("serving");
   if(first){
     box.className="serving";
