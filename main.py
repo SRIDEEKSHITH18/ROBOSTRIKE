@@ -473,6 +473,7 @@ async def manual_add(request: Request):
     status, data = await add_to_queue(body.get("rollNo"), "manual")
     return JSONResponse(data, status_code=status)
 
+
 @app.post("/api/integrations/rc/queue")
 async def rc_add_to_queue(
     payload: RCScanRequest,
@@ -492,7 +493,7 @@ async def rc_add_to_queue(
             status_code=401,
         )
 
-    roll_no = payload.rollNumber.strip()
+    roll_no = clean_roll(payload.rollNumber)
 
     if not roll_no:
         return JSONResponse(
@@ -500,9 +501,56 @@ async def rc_add_to_queue(
             status_code=400,
         )
 
-    status, data = await add_to_queue(roll_no, "rfid")
+    # Search the students collection for this roll number.
+    student = await find_student(roll_no)
 
-    return JSONResponse(content=data, status_code=status)
+    if student:
+        # Existing student: use the actual name from the database.
+        status, data = await add_to_queue(student["rollNo"], "rfid")
+        return JSONResponse(content=data, status_code=status)
+
+    # Unknown roll number: use the roll number as the name.
+    existing = await db["queue"].find_one({
+        "rollNo": roll_no,
+        "status": "waiting"
+    })
+
+    if existing:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Already in queue",
+                "entry": serialize(existing)
+            },
+            status_code=409,
+        )
+
+    entry = {
+        "rollNo": roll_no,
+        "name": roll_no,
+        "personType": "student",
+        "source": "rfid",
+        "status": "waiting",
+        "addedAt": now(),
+    }
+
+    result = await db["queue"].insert_one(entry)
+    entry["_id"] = result.inserted_id
+
+    await broadcast("scan", {
+        "ok": True,
+        "rollNo": roll_no,
+        "name": roll_no,
+        "source": "rfid",
+        "message": f"{roll_no} added to queue"
+    })
+
+    await broadcast_queue()
+
+    return JSONResponse(
+        content={"ok": True, "entry": serialize(entry)},
+        status_code=201,
+    )
 
 # ---------------- scoring / leaderboard ----------------
 def check_darts_api_key(supplied_key: str):
